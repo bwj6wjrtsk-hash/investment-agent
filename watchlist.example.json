@@ -1,0 +1,13 @@
+[
+  {
+    "code": "600000",
+    "market": "sh",
+    "name": "示例股票",
+    "group": "默认",
+    "reason": "示例关注理由",
+    "target_price": null,
+    "stop_loss": null,
+    "alert_up_pct": null,
+    "alert_down_pct": null
+  }
+]

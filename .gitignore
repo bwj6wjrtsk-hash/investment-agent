@@ -1,0 +1,35 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+
+# Personal investment and runtime data
+portfolio.json
+watchlist.json
+trades.json
+chat_history.json
+data/*.json
+data/chromadb/
+
+# Python environments and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# Local runtime artifacts
+*.log
+*.db
+*.db-shm
+*.db-wal
+.installed
+*.lnk
+desktop.ini
+
+# IDE and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

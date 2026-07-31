@@ -1,0 +1,2364 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DataBoard</title>
+    <script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        :root {
+            --primary: #1a73e8;
+            --primary-light: #e8f0fe;
+            --danger: #d93025;
+            --success: #188038;
+            --bg: #f8f9fa;
+            --card-bg: #ffffff;
+            --text: #202124;
+            --text-secondary: #5f6368;
+            --border: #dadce0;
+            --shadow: 0 1px 3px rgba(0,0,0,0.12), 0 1px 2px rgba(0,0,0,0.08);
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            line-height: 1.6;
+            zoom: 50%;
+        }
+        .navbar {
+            background: var(--card-bg);
+            border-bottom: 1px solid var(--border);
+            padding: 12px 24px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            position: sticky;
+            top: 0;
+            z-index: 100;
+        }
+        .navbar h1 { font-size: 20px; font-weight: 600; }
+        .navbar .status {
+            font-size: 12px;
+            color: var(--success);
+            display: flex;
+            align-items: center;
+            gap: 4px;
+        }
+        .navbar .status::before {
+            content: "";
+            width: 8px;
+            height: 8px;
+            background: var(--success);
+            border-radius: 50%;
+        }
+        .main-layout {
+            display: grid;
+            grid-template-columns: 1fr 550px;
+            height: calc(100vh - 57px);
+            max-width: 1600px;
+            margin: 0 auto;
+        }
+
+        /* Left data panel with tabs */
+        .data-panel {
+            display: flex;
+            flex-direction: column;
+            height: calc(100vh - 57px);
+            overflow: hidden;
+        }
+        .tab-bar {
+            display: flex;
+            gap: 8px;
+            padding: 16px 20px 12px 20px;
+            background: var(--card-bg);
+            border-bottom: 1px solid var(--border);
+            flex-shrink: 0;
+            overflow-x: auto;
+            scrollbar-width: thin;
+        }
+        .tab-btn {
+            flex: 0 0 auto;
+            padding: 6px 16px;
+            border: none;
+            border-radius: 20px;
+            font-size: 13px;
+            font-weight: 500;
+            cursor: pointer;
+            background: #f1f3f4;
+            color: var(--text-secondary);
+            transition: all 0.2s;
+        }
+        .tab-btn:hover {
+            background: var(--primary-light);
+            color: var(--primary);
+        }
+        .tab-btn.active {
+            background: var(--primary);
+            color: white;
+        }
+        .tab-content {
+            display: none;
+            padding: 20px;
+            overflow-y: auto;
+            flex: 1;
+        }
+        .tab-content.active {
+            display: block;
+        }
+
+        /* Section titles */
+        .section-title {
+            font-size: 11px;
+            font-weight: 600;
+            color: var(--text-secondary);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 12px;
+            margin-top: 4px;
+        }
+
+        /* Cards */
+        .card {
+            background: var(--card-bg);
+            border-radius: 12px;
+            padding: 16px;
+            box-shadow: var(--shadow);
+            margin-bottom: 20px;
+        }
+        .card h3 {
+            font-size: 14px;
+            font-weight: 600;
+            margin-bottom: 12px;
+            padding-bottom: 8px;
+            border-bottom: 1px solid var(--border);
+            color: var(--text-secondary);
+        }
+
+        /* Indices grid */
+        .indices-grid {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 12px;
+            margin-bottom: 20px;
+        }
+        .index-card {
+            background: var(--card-bg);
+            border-radius: 12px;
+            padding: 16px;
+            box-shadow: var(--shadow);
+            text-align: center;
+        }
+        .index-card .name { font-size: 12px; color: var(--text-secondary); margin-bottom: 4px; }
+        .index-card .price { font-size: 24px; font-weight: 700; margin-bottom: 2px; }
+        .index-card .change { font-size: 14px; font-weight: 500; }
+        .up { color: var(--danger); }
+        .down { color: var(--success); }
+
+        /* Stats row */
+        .stats-row { display: flex; gap: 12px; margin-bottom: 20px; }
+        .stat-item {
+            background: var(--card-bg);
+            border-radius: 12px;
+            padding: 12px 16px;
+            box-shadow: var(--shadow);
+            flex: 1;
+            text-align: center;
+        }
+        .stat-item .label { font-size: 11px; color: var(--text-secondary); }
+        .stat-item .value { font-size: 18px; font-weight: 700; margin-top: 2px; }
+
+        /* List items */
+        .list-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 8px 0;
+            font-size: 13px;
+            border-bottom: 1px solid #f1f3f4;
+        }
+        .list-item:last-child { border-bottom: none; }
+        .list-item .name { color: var(--text); font-weight: 500; }
+        .flow-value { font-weight: 600; font-size: 13px; }
+
+        /* Search bar */
+        .search-bar { margin-bottom: 20px; display: flex; gap: 8px; }
+        .search-bar input {
+            flex: 1;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 10px 14px;
+            font-size: 14px;
+            outline: none;
+        }
+        .search-bar input:focus { border-color: var(--primary); }
+        .search-bar button {
+            padding: 10px 20px;
+            background: var(--primary);
+            color: white;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 14px;
+        }
+
+        /* Notes */
+        .note-area textarea {
+            width: 100%;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 12px;
+            font-size: 14px;
+            resize: vertical;
+            min-height: 120px;
+            outline: none;
+            font-family: inherit;
+        }
+        .note-area textarea:focus { border-color: var(--primary); }
+        .note-area .note-actions { margin-top: 8px; display: flex; gap: 8px; align-items: center; }
+        .note-area .note-actions input {
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            padding: 6px 10px;
+            font-size: 13px;
+            width: 120px;
+            outline: none;
+        }
+        .note-area .note-actions button {
+            padding: 6px 16px;
+            background: var(--primary);
+            color: white;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 13px;
+        }
+
+        /* Chat panel */
+        .chat-panel {
+            border-left: 1px solid var(--border);
+            display: flex;
+            flex-direction: column;
+            background: var(--card-bg);
+            height: calc(100vh - 57px);
+            overflow: hidden;
+        }
+        .chat-header {
+            padding: 16px 20px;
+            border-bottom: 1px solid var(--border);
+            font-weight: 600;
+            font-size: 15px;
+            flex-shrink: 0;
+        }
+        .chat-messages { flex: 1; overflow-y: auto; padding: 16px 20px; min-height: 0; }
+        .message { margin-bottom: 16px; animation: fadeIn 0.3s ease; }
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(8px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        .message.user { text-align: right; }
+        .message .bubble {
+            display: inline-block;
+            max-width: 85%;
+            padding: 10px 14px;
+            border-radius: 12px;
+            font-size: 14px;
+            line-height: 1.5;
+            text-align: left;
+            word-break: break-word;
+        }
+        .message.user .bubble {
+            white-space: pre-wrap;
+        }
+        .message.user .bubble {
+            background: var(--primary);
+            color: white;
+            border-bottom-right-radius: 4px;
+        }
+        .message.assistant .bubble {
+            background: #f1f3f4;
+            color: var(--text);
+            border-bottom-left-radius: 4px;
+        }
+        .message.assistant .bubble h1,.message.assistant .bubble h2,.message.assistant .bubble h3 {
+            font-size: 13px; font-weight: 600; margin: 10px 0 4px 0; color: var(--text);
+        }
+        .message.assistant .bubble h1:first-child,.message.assistant .bubble h2:first-child,.message.assistant .bubble h3:first-child { margin-top: 0; }
+        .message.assistant .bubble p { margin: 4px 0; font-size: 13px; }
+        .message.assistant .bubble ul,.message.assistant .bubble ol { padding-left: 16px; margin: 4px 0; font-size: 13px; }
+        .message.assistant .bubble li { margin: 2px 0; }
+        .message.assistant .bubble table { border-collapse: collapse; margin: 6px 0; font-size: 12px; width: 100%; }
+        .message.assistant .bubble th,.message.assistant .bubble td { border: 1px solid var(--border); padding: 3px 6px; text-align: left; }
+        .message.assistant .bubble th { background: #f8f9fa; font-weight: 600; }
+        .message.assistant .bubble strong { font-weight: 600; }
+        .message.assistant .bubble hr { border: none; border-top: 1px solid var(--border); margin: 8px 0; }
+        .message.assistant .bubble code { background: #e8eaed; padding: 1px 4px; border-radius: 3px; font-size: 12px; }
+        .message .time { font-size: 11px; color: var(--text-secondary); margin-top: 4px; }
+        .typing-indicator {
+            display: none;
+            padding: 10px 14px;
+            background: #f1f3f4;
+            border-radius: 12px;
+            margin-bottom: 16px;
+            width: fit-content;
+        }
+        .typing-indicator.show { display: block; }
+        .typing-indicator span {
+            display: inline-block;
+            width: 8px;
+            height: 8px;
+            background: #5f6368;
+            border-radius: 50%;
+            margin-right: 4px;
+            animation: bounce 1.4s infinite;
+        }
+        .typing-indicator span:nth-child(2) { animation-delay: 0.2s; }
+        .typing-indicator span:nth-child(3) { animation-delay: 0.4s; }
+        @keyframes bounce {
+            0%, 60%, 100% { transform: translateY(0); }
+            30% { transform: translateY(-4px); }
+        }
+        .chat-input-area { padding: 16px 20px; border-top: 1px solid var(--border); }
+        .input-wrapper { display: flex; gap: 8px; }
+        .chat-input {
+            flex: 1;
+            border: 1px solid var(--border);
+            border-radius: 24px;
+            padding: 10px 18px;
+            font-size: 14px;
+            outline: none;
+            transition: border-color 0.2s;
+        }
+        .chat-input:focus { border-color: var(--primary); }
+        .send-btn {
+            background: var(--primary);
+            color: white;
+            border: none;
+            border-radius: 50%;
+            width: 40px;
+            height: 40px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: background 0.2s;
+        }
+        .send-btn:hover { background: #1557b0; }
+        .send-btn:disabled { background: #dadce0; cursor: not-allowed; }
+        .send-btn svg { width: 18px; height: 18px; }
+        .quick-actions { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
+        .quick-btn {
+            font-size: 12px;
+            padding: 4px 10px;
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            background: white;
+            cursor: pointer;
+            color: var(--text-secondary);
+            transition: all 0.2s;
+        }
+        .quick-btn:hover {
+            background: var(--primary-light);
+            border-color: var(--primary);
+            color: var(--primary);
+        }
+        .loading {
+            text-align: center;
+            color: var(--text-secondary);
+            padding: 40px;
+            font-size: 14px;
+        }
+        .loading::after { content: "..."; animation: dots 1.5s infinite; }
+        @keyframes dots {
+            0%, 20% { content: "."; }
+            40% { content: ".."; }
+            60%, 100% { content: "..."; }
+        }
+        .toast {
+            position: fixed;
+            bottom: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: #323232;
+            color: white;
+            padding: 10px 24px;
+            border-radius: 8px;
+            font-size: 14px;
+            z-index: 999;
+            display: none;
+            animation: slideUp 0.3s ease;
+        }
+        .toast.show { display: block; }
+        @keyframes slideUp {
+            from { transform: translateX(-50%) translateY(20px); opacity: 0; }
+            to { transform: translateX(-50%) translateY(0); opacity: 1; }
+        }
+        @media (max-width: 1024px) {
+            .main-layout { grid-template-columns: 1fr; }
+            .chat-panel { border-left: none; border-top: 1px solid var(--border); height: 50vh; }
+            .data-panel { height: auto; }
+        }
+    </style>
+</head>
+<body>
+    <nav class="navbar">
+        <h1>DataBoard</h1>
+        <div class="status" id="serviceStatus" title="正在检查服务状态">连接中</div>
+    </nav>
+
+    <div class="main-layout">
+        <div class="data-panel">
+            <!-- Tab bar -->
+            <div class="tab-bar" role="tablist" aria-label="数据模块">
+                <button class="tab-btn active" onclick="showTab(0)">总览</button>
+                <button class="tab-btn" onclick="showTab(1)">持仓</button>
+                <button class="tab-btn" onclick="showTab(2)">自选</button>
+                <button class="tab-btn" onclick="showTab(3)">板块</button>
+                <button class="tab-btn" onclick="showTab(4)">笔记</button>
+                <button class="tab-btn" onclick="showTab(5)">新闻</button>
+            </div>
+
+            <!-- Tab 0: 总览 -->
+            <div class="tab-content active" id="tab-0">
+                <div class="search-bar">
+                    <input type="text" id="stockSearch" placeholder="输入股票代码，如 000001" maxlength="6">
+                    <button onclick="searchStock()">查询</button>
+                </div>
+
+                <div class="section-title">大盘指数</div>
+                <div class="indices-grid" id="indicesGrid">
+                    <div class="loading">加载中</div>
+                </div>
+
+                <div class="stats-row" id="statsRow"></div>
+
+                <div class="card">
+                    <h3>板块 ETF 成交额 / 活跃度</h3>
+                    <div id="sectorList"><div class="loading">加载中</div></div>
+                </div>
+
+                <div class="card">
+                    <h3>持仓概览</h3>
+                    <div id="portfolioSummary" style="font-size:15px;font-weight:600;padding:8px 0;color:var(--text-secondary)">加载中...</div>
+                </div>
+            </div>
+
+            <!-- Tab 1: 持仓 -->
+            <div class="tab-content" id="tab-1">
+                <div class="card">
+                    <h3>收益汇总</h3>
+                    <div id="profitSummary" style="display:flex;gap:16px;flex-wrap:wrap">
+                        <div style="text-align:center;flex:1">
+                            <div style="font-size:11px;color:var(--text-secondary)">已实现收益</div>
+                            <div id="realizedProfit" style="font-size:18px;font-weight:700">--</div>
+                        </div>
+                        <div style="text-align:center;flex:1">
+                            <div style="font-size:11px;color:var(--text-secondary)">当前浮盈</div>
+                            <div id="unrealizedProfit" style="font-size:18px;font-weight:700">--</div>
+                        </div>
+                        <div style="text-align:center;flex:1">
+                            <div style="font-size:11px;color:var(--text-secondary)">总收益</div>
+                            <div id="totalProfit" style="font-size:18px;font-weight:700">--</div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <h3>我的持仓 <button onclick="togglePortfolioEdit()" style="float:right;font-size:12px;padding:2px 8px;border:1px solid var(--border);border-radius:4px;background:white;cursor:pointer">管理</button></h3>
+                    <div id="portfolioList"><div class="loading">加载中</div></div>
+                    <div id="portfolioEdit" style="display:none;border-top:1px solid var(--border);margin-top:12px;padding-top:12px">
+                        <div style="font-size:13px;font-weight:500;margin-bottom:8px">添加持仓</div>
+                        <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px">
+                            <input type="text" id="addCode" placeholder="代码" style="width:80px;padding:6px 8px;border:1px solid var(--border);border-radius:4px;font-size:12px">
+                            <input type="number" id="addCost" placeholder="成本价" step="0.001" style="width:80px;padding:6px 8px;border:1px solid var(--border);border-radius:4px;font-size:12px">
+                            <input type="number" id="addShares" placeholder="数量" style="width:80px;padding:6px 8px;border:1px solid var(--border);border-radius:4px;font-size:12px">
+                            <button onclick="addPosition()" style="padding:6px 12px;background:var(--primary);color:white;border:none;border-radius:4px;cursor:pointer;font-size:12px">添加</button>
+                        </div>
+                        <div style="font-size:13px;font-weight:500;margin-bottom:8px">当前持仓</div>
+                        <div id="portfolioEditList"></div>
+                    </div>
+                </div>
+
+
+            <div class="card">
+                <h3>交易记录 <button onclick="showTradeForm()" style="float:right;font-size:12px;padding:2px 8px;border:1px solid var(--border);border-radius:4px;background:white;cursor:pointer">记一笔</button></h3>
+                <div id="tradeForm" style="display:none;margin-bottom:12px;padding-bottom:12px;border-bottom:1px solid var(--border)">
+                    <div style="display:flex;gap:6px;flex-wrap:wrap">
+                        <select id="tradeAction" style="padding:6px 8px;border:1px solid var(--border);border-radius:4px;font-size:12px">
+                            <option value="buy">买入</option>
+                            <option value="sell">卖出</option>
+                        </select>
+                        <input type="text" id="tradeCode" placeholder="代码" style="width:70px;padding:6px 8px;border:1px solid var(--border);border-radius:4px;font-size:12px">
+                        <input type="number" id="tradePrice" placeholder="价格" step="0.001" style="width:70px;padding:6px 8px;border:1px solid var(--border);border-radius:4px;font-size:12px">
+                        <input type="number" id="tradeShares" placeholder="数量" style="width:70px;padding:6px 8px;border:1px solid var(--border);border-radius:4px;font-size:12px">
+                        <button onclick="addTrade()" style="padding:6px 12px;background:var(--primary);color:white;border:none;border-radius:4px;cursor:pointer;font-size:12px">记录</button>
+                    </div>
+                </div>
+                <div id="tradesList" style="max-height:300px;overflow-y:auto"><div class="loading">加载中</div></div>
+            </div>
+            </div>
+
+            <!-- Tab 2: 自选 -->
+            <div class="tab-content" id="tab-2">
+                <div class="card">
+                    <h3>自选股</h3>
+                    <div id="watchlistStocks"></div>
+                    <div style="display:flex;gap:6px;margin-top:12px">
+                        <input type="text" id="watchCode" placeholder="输入代码" style="width:100px;padding:6px 8px;border:1px solid var(--border);border-radius:4px;font-size:12px">
+                        <button onclick="addWatch()" style="padding:6px 12px;background:var(--primary);color:white;border:none;border-radius:4px;cursor:pointer;font-size:12px">添加</button>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <h3>操作建议</h3>
+                    <div id="signalsList"><div class="loading">加载中</div></div>
+                </div>
+            </div>
+
+            <!-- Tab 3: 板块 -->
+            <div class="tab-content" id="tab-3">
+                <div class="card">
+                    <h3>板块动态</h3>
+                    <div id="sectorDynamics"><div class="loading">加载中</div></div>
+                </div>
+            </div>
+
+            <!-- Tab 4: 笔记 -->
+            <div class="tab-content" id="tab-4">
+                <div class="card note-area">
+                    <h3>投资笔记</h3>
+                    <textarea id="noteContent" placeholder="记录你的投资心得..."></textarea>
+                    <div class="note-actions">
+                        <input type="text" id="noteStock" placeholder="相关代码">
+                        <button onclick="saveNote()">保存</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Tab 5: 新闻 -->
+            <div class="tab-content" id="tab-5">
+                <div class="card">
+                    <h3>每日财经新闻
+                        <span id="newsUpdated" style="float:right;font-size:11px;color:var(--text-secondary);font-weight:400"></span>
+                    </h3>
+                    <div style="display:flex;gap:6px;margin:10px 0;flex-wrap:wrap;align-items:center">
+                        <input type="text" id="newsSearch" placeholder="搜索关键词" style="flex:1;min-width:120px;padding:6px 8px;border:1px solid var(--border);border-radius:4px;font-size:12px" oninput="renderDailyNews()">
+                        <label style="font-size:12px;color:var(--text-secondary);display:flex;align-items:center;gap:4px;cursor:pointer;white-space:nowrap">
+                            <input type="checkbox" id="newsOnlyRelated" onchange="renderDailyNews()"> 只看与我相关
+                        </label>
+                        <button onclick="loadDailyNews()" style="padding:6px 12px;background:var(--primary);color:white;border:none;border-radius:4px;cursor:pointer;font-size:12px">刷新</button>
+                    </div>
+                    <div id="newsCategories" style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px"></div>
+                    <div id="dailyNewsList"><div class="loading">加载中</div></div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Chat panel -->
+        <div class="chat-panel">
+            <div class="chat-header">
+                <span id="chatHeaderTitle">AI Assistant</span>
+                <span id="aiBalance" style="font-size:11px;color:var(--text-secondary);margin-left:8px;cursor:pointer" onclick="loadAiBalance()" title="点击刷新余额"></span>
+                <button onclick="newChat()" style="float:right;font-size:11px;padding:2px 8px;border:1px solid var(--border);border-radius:4px;background:white;cursor:pointer;color:var(--text-secondary);margin-left:4px">新对话</button>
+                <button onclick="showHistory()" style="float:right;font-size:11px;padding:2px 8px;border:1px solid var(--border);border-radius:4px;background:white;cursor:pointer;color:var(--text-secondary)">历史</button>
+            </div>
+            <div class="chat-messages" id="chatMessages">
+                <div class="message assistant">
+                    <div class="bubble">你好！我是你的A股投资分析助手，可以帮你：
+
+- 分析个股行情和技术指标
+- 查看大盘和板块概况
+- 计算网格交易和加仓方案
+- 回测交易策略
+- 板块轮动监控
+- 估值分析和选股
+
+试试下面的快捷按钮，或者直接输入问题。</div>
+                </div>
+            </div>
+            <div class="typing-indicator" id="typingIndicator">
+                <span></span><span></span><span></span>
+            </div>
+            <div class="chat-input-area">
+                <div class="input-wrapper">
+                    <input type="text" class="chat-input" id="chatInput"
+                           placeholder="输入你的问题..."
+                           onkeydown="if(event.key==='Enter')sendMessage()">
+                    <button class="send-btn" id="sendBtn" onclick="sendMessage()">
+                        <svg viewBox="0 0 24 24" fill="currentColor">
+                            <path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/>
+                        </svg>
+                    </button>
+                    <button class="send-btn" id="cancelBtn" onclick="cancelMessage()" style="display:none;background:var(--danger)">
+                        <svg viewBox="0 0 24 24" fill="currentColor">
+                            <path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/>
+                        </svg>
+                    </button>
+                </div>
+                <div class="quick-actions">
+                    <button class="quick-btn" onclick="quickAsk('今天大盘怎么样？')">大盘</button>
+                    <button class="quick-btn" onclick="quickAsk('哪些板块ETF成交最活跃？')">ETF活跃度</button>
+                    <button class="quick-btn" onclick="quickAsk('最近有什么财经新闻？')">新闻</button>
+                    <button class="quick-btn" onclick="quickAsk('我的持仓现在怎么样？')">持仓</button>
+                    <button class="quick-btn" onclick="quickAsk('今天哪个板块最强？')">板块轮动</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="toast" id="toast"></div>
+
+    <script>
+        // 所有 POST 自动带可选本地 token；首次遇到 401 时提示一次并重试。
+        const nativeFetch = window.fetch.bind(window);
+        window.fetch = async function(input, init = {}) {
+            const options = {...init};
+            const method = String(options.method || "GET").toUpperCase();
+            if (method === "POST") {
+                options.headers = new Headers(options.headers || {});
+                const token = localStorage.getItem("dashboardToken");
+                if (token) options.headers.set("X-Auth-Token", token);
+            }
+            let response = await nativeFetch(input, options);
+            if (method === "POST" && response.status === 401) {
+                const token = window.prompt("写操作需要访问令牌，请输入 DASHBOARD_TOKEN：");
+                if (token) {
+                    localStorage.setItem("dashboardToken", token.trim());
+                    options.headers = new Headers(options.headers || {});
+                    options.headers.set("X-Auth-Token", token.trim());
+                    response = await nativeFetch(input, options);
+                    if (response.status === 401) localStorage.removeItem("dashboardToken");
+                }
+            }
+            return response;
+        };
+
+        async function fetchWithTimeout(input, init = {}, timeoutMs = 25000) {
+            const controller = new AbortController();
+            const timer = setTimeout(() => controller.abort(), timeoutMs);
+            try {
+                return await fetch(input, {...init, signal: controller.signal});
+            } catch (error) {
+                if (error.name === 'AbortError') throw new Error(`请求超过 ${Math.round(timeoutMs / 1000)} 秒`);
+                throw error;
+            } finally {
+                clearTimeout(timer);
+            }
+        }
+
+        const loadedTabs = new Set();
+        const loaderInFlight = new Map();
+        let activeTab = 0;
+
+        function runLoader(loader, label = 'loader') {
+            if (typeof loader !== 'function') return Promise.resolve();
+            const existing = loaderInFlight.get(loader);
+            if (existing) return existing;
+            const task = Promise.resolve()
+                .then(() => loader())
+                .catch(error => console.error(`${label} 加载失败`, error))
+                .finally(() => {
+                    if (loaderInFlight.get(loader) === task) loaderInFlight.delete(loader);
+                });
+            loaderInFlight.set(loader, task);
+            return task;
+        }
+
+        function loadTabData(index) {
+            const loaderNames = {
+                0: ['loadMarketOverview', 'loadSectorFlow', 'loadPortfolio'],
+                1: ['loadPortfolio', 'loadProfitSummary', 'loadTrades', 'loadPortfolioHealth', 'loadAttribution'],
+                2: ['loadWatchlist', 'loadSignals'],
+                3: ['loadBankNews'],
+                5: ['loadDailyNews'],
+                6: ['loadInsights'],
+            };
+            let started = false;
+            for (const name of loaderNames[index] || []) {
+                const loader = window[name];
+                if (typeof loader !== 'function') {
+                    console.warn(`模块加载器尚未就绪: ${name}`);
+                    continue;
+                }
+                started = true;
+                runLoader(loader, name);
+            }
+            return started;
+        }
+
+        function showTab(index) {
+            activeTab = index;
+            const tabs = document.querySelectorAll('.tab-content');
+            const btns = document.querySelectorAll('.tab-btn');
+            tabs.forEach((tab, i) => {
+                tab.classList.toggle('active', i === index);
+                tab.setAttribute('role', 'tabpanel');
+                tab.setAttribute('aria-hidden', i === index ? 'false' : 'true');
+            });
+            btns.forEach((btn, i) => {
+                btn.classList.toggle('active', i === index);
+                btn.setAttribute('role', 'tab');
+                btn.setAttribute('aria-selected', i === index ? 'true' : 'false');
+                btn.tabIndex = i === index ? 0 : -1;
+            });
+            if (!loadedTabs.has(index) && loadTabData(index)) {
+                loadedTabs.add(index);
+            } else if (index === 2) {
+                // 自选行情切回页面时立即刷新；若已有请求在途则直接复用。
+                runLoader(window.loadWatchlist, 'loadWatchlist');
+            }
+        }
+
+        function scheduleVisibleRefresh(loader, intervalMs, requiredTabs = []) {
+            return setInterval(() => {
+                if (document.hidden) return;
+                if (requiredTabs.length && !requiredTabs.includes(activeTab)) return;
+                runLoader(loader, loader.name || '定时模块');
+            }, intervalMs);
+        }
+
+        function setServiceStatus(online, message = '') {
+            const status = document.getElementById('serviceStatus');
+            if (!status) return;
+            status.textContent = online ? '在线' : '连接异常';
+            status.title = message || (online ? '数据服务正常' : '数据服务不可用');
+            status.style.color = online ? 'var(--success)' : 'var(--danger)';
+        }
+
+        async function loadMarketOverview() {
+            try {
+                const resp = await fetchWithTimeout("/api/market-overview");
+                const data = await resp.json();
+                if (!resp.ok || data.error) throw new Error(data.error || `HTTP ${resp.status}`);
+                setServiceStatus(true);
+                const grid = document.getElementById("indicesGrid");
+                grid.innerHTML = data.indices.map(idx => `
+                    <div class="index-card">
+                        <div class="name">${escapeHtml(idx.name || '')}</div>
+                        <div class="price ${idx.change_pct >= 0 ? 'up' : 'down'}">${idx.price.toFixed(2)}</div>
+                        <div class="change ${idx.change_pct >= 0 ? 'up' : 'down'}">${idx.change_pct >= 0 ? '+' : ''}${idx.change_pct.toFixed(2)}%</div>
+                    </div>
+                `).join("");
+                const stats = data.stats;
+                const fmt = v => (v === null || v === undefined) ? "—" : v;
+                document.getElementById("statsRow").innerHTML = `
+                    <div class="stat-item"><div class="label">上涨</div><div class="value up">${fmt(stats.up)}</div></div>
+                    <div class="stat-item"><div class="label">下跌</div><div class="value down">${fmt(stats.down)}</div></div>
+                    <div class="stat-item"><div class="label">平盘</div><div class="value">${fmt(stats.flat)}</div></div>
+                `;
+            } catch (e) {
+                setServiceStatus(false, e.message);
+                document.getElementById("indicesGrid").innerHTML = `<div style="color:var(--danger);padding:12px;">加载失败: ${escapeHtml(e.message)}</div>`;
+            }
+        }
+
+        async function loadSectorFlow() {
+            try {
+                const resp = await fetchWithTimeout("/api/sector-flow");
+                const data = await resp.json();
+                if (data.error) throw new Error(data.error);
+                document.getElementById("sectorList").innerHTML = data.sectors.map(s => `
+                    <div class="list-item">
+                        <span class="name">${escapeHtml(s.name || '')}</span>
+                        <span class="flow-value ${s.flow >= 0 ? 'up' : 'down'}">${s.flow >= 0 ? '+' : ''}${s.flow.toFixed(2)}亿</span>
+                    </div>
+                `).join("");
+            } catch (e) {
+                document.getElementById("sectorList").innerHTML = `<div>加载失败</div>`;
+            }
+        }
+
+        async function loadHotStocks() {
+            try {
+                const resp = await fetch("/api/hot-stocks");
+                const data = await resp.json();
+                if (data.error) throw new Error(data.error);
+                document.getElementById("hotList").innerHTML = data.stocks.slice(0, 10).map(s => `
+                    <div class="list-item">
+                        <span class="name">${escapeHtml(s.name || '')}</span>
+                        <span class="${s.change_pct >= 0 ? 'up' : 'down'}">${s.change_pct !== null ? (s.change_pct >= 0 ? '+' : '') + s.change_pct.toFixed(2) + '%' : '-'}</span>
+                    </div>
+                `).join("");
+            } catch (e) {
+                document.getElementById("hotList").innerHTML = `<div>加载失败</div>`;
+            }
+        }
+
+        let isProcessing = false;
+        let currentAbortController = null;
+        let chatHistory = [];
+        let currentSessionId = Date.now().toString();
+
+        async function loadAiBalance() {
+            try {
+                const resp = await fetch("/api/ai-balance");
+                const data = await resp.json();
+                const el = document.getElementById("aiBalance");
+                if (data.balance) {
+                    el.textContent = `余额: ¥${parseFloat(data.balance).toFixed(2)}`;
+                }
+            } catch(e) {}
+        }
+
+        function loadChatHistory() {
+            try {
+                fetch("/api/chat-history")
+                    .then(r => r.json())
+                    .then(data => {
+                        if (data.sessions) {
+                            window._chatSessions = data.sessions;
+                        }
+                    });
+            } catch(e) {}
+        }
+
+        function showHistory() {
+            const sessions = (window._chatSessions || []).filter(s => s.messages && s.messages.length > 0);
+            const messages = document.getElementById("chatMessages");
+
+            if (messages.dataset.showingHistory === "true") {
+                // Go back to current chat
+                backToCurrentChat();
+                return;
+            }
+
+            if (sessions.length === 0) {
+                showToast("暂无历史记录");
+                return;
+            }
+
+            messages.dataset.showingHistory = "true";
+            document.getElementById("chatHeaderTitle").textContent = "历史会话";
+
+            // Show session list (newest first)
+            let html = '<div style="padding:4px 0">';
+            for (let i = sessions.length - 1; i >= 0; i--) {
+                const session = sessions[i];
+                const firstMsg = session.messages.find(m => m.role === "user");
+                const title = firstMsg ? firstMsg.content.slice(0, 30) + (firstMsg.content.length > 30 ? '...' : '') : '(空)';
+                const isCurrent = session.id === currentSessionId;
+                html += `
+                    <div onclick="${isCurrent ? 'backToCurrentChat()' : `viewSession(${i})`}"
+                         style="padding:10px 12px;border-bottom:1px solid #f1f3f4;cursor:pointer;transition:background 0.2s;${isCurrent ? 'background:var(--primary-light)' : ''}"
+                         onmouseover="this.style.background='#f1f3f4'" onmouseout="this.style.background='${isCurrent ? 'var(--primary-light)' : ''}'">
+                        <div style="font-size:13px;font-weight:500;color:var(--text)">${isCurrent ? '● ' : ''}${escapeHtml(title)}</div>
+                        <div style="font-size:11px;color:var(--text-secondary);margin-top:2px">${escapeHtml(session.date || '')} · ${session.messages.length}条${isCurrent ? ' (当前)' : ''}</div>
+                    </div>`;
+            }
+            html += '</div>';
+            messages.innerHTML = html;
+        }
+
+        function viewSession(sessionIndex) {
+            const sessions = window._chatSessions || [];
+            const session = sessions[sessionIndex];
+            if (!session) return;
+
+            const messages = document.getElementById("chatMessages");
+            messages.dataset.showingHistory = "viewing";
+            document.getElementById("chatHeaderTitle").textContent = "历史会话";
+
+            let html = `<div style="text-align:center;padding:8px"><button onclick="showHistory()" style="font-size:11px;padding:4px 12px;border:1px solid var(--border);border-radius:4px;background:white;cursor:pointer;color:var(--text-secondary)">← 返回列表</button></div>`;
+            html += `<div style="text-align:center;font-size:11px;color:var(--text-secondary);padding:4px">${escapeHtml(session.date || '')}</div>`;
+            for (const msg of session.messages) {
+                const role = msg.role === "assistant" ? "assistant" : "user";
+                const rendered = role === "assistant" ? marked.parse(msg.content) : escapeHtml(msg.content);
+                html += `<div class="message ${role}"><div class="bubble">${rendered}</div><div class="time">${escapeHtml(msg.time || '')}</div></div>`;
+            }
+            messages.innerHTML = html;
+            messages.scrollTop = 0;
+        }
+
+        function backToCurrentChat() {
+            const messages = document.getElementById("chatMessages");
+            messages.dataset.showingHistory = "false";
+            document.getElementById("chatHeaderTitle").textContent = "AI Assistant";
+
+            // Restore current session messages
+            let html = `<div class="message assistant"><div class="bubble">${marked.parse("Hello! I'm your analysis assistant. Ask me anything.")}</div></div>`;
+            for (const msg of chatHistory) {
+                const role = msg.role === "assistant" ? "assistant" : "user";
+                const rendered = role === "assistant" ? marked.parse(msg.content) : escapeHtml(msg.content);
+                html += `<div class="message ${role}"><div class="bubble">${rendered}</div><div class="time">${escapeHtml(msg.time || '')}</div></div>`;
+            }
+            messages.innerHTML = html;
+            messages.scrollTop = messages.scrollHeight;
+        }
+
+        function newChat() {
+            // Save current session first
+            if (chatHistory.length > 0) {
+                saveChatHistory();
+            }
+            // Start new session
+            currentSessionId = Date.now().toString();
+            chatHistory = [];
+            backToCurrentChat();
+            showToast("新对话已开始");
+        }
+
+        function saveChatHistory() {
+            try {
+                let sessions = window._chatSessions || [];
+                let current = sessions.find(s => s.id === currentSessionId);
+                if (!current) {
+                    current = { id: currentSessionId, date: new Date().toLocaleString("zh-CN"), messages: [] };
+                    sessions.push(current);
+                }
+                current.messages = chatHistory;
+                if (sessions.length > 20) sessions = sessions.slice(-20);
+                window._chatSessions = sessions;
+                fetch("/api/chat-history/save", {
+                    method: "POST",
+                    headers: {"Content-Type": "application/json"},
+                    body: JSON.stringify({sessions})
+                });
+            } catch(e) {}
+        }
+
+        function clearChatHistory() {
+            if (!confirm("确认清空所有历史记录？")) return;
+            chatHistory = [];
+            window._chatSessions = [];
+            fetch("/api/chat-history/clear", {method: "POST"});
+            backToCurrentChat();
+            showToast("已清空");
+        }
+
+        function addMessage(role, content) {
+            const messages = document.getElementById("chatMessages");
+            const time = new Date().toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" });
+            const div = document.createElement("div");
+            div.className = `message ${role}`;
+            const rendered = role === "assistant" ? marked.parse(content) : escapeHtml(content);
+            div.innerHTML = `<div class="bubble">${rendered}</div><div class="time">${time}</div>`;
+            messages.appendChild(div);
+            messages.scrollTop = messages.scrollHeight;
+            chatHistory.push({role, content, time});
+            saveChatHistory();
+        }
+
+        function escapeHtml(text) {
+            const div = document.createElement("div");
+            div.textContent = text == null ? "" : String(text);
+            return div.innerHTML;
+        }
+
+        function safeExternalUrl(value) {
+            if (typeof value !== "string" || !value.trim()) return "";
+            try {
+                const url = new URL(value.trim(), window.location.origin);
+                return (url.protocol === "http:" || url.protocol === "https:") ? url.href : "";
+            } catch (_) {
+                return "";
+            }
+        }
+
+        function sanitizeHtml(html) {
+            const template = document.createElement("template");
+            template.innerHTML = String(html || "");
+            template.content.querySelectorAll(
+                "script,style,iframe,object,embed,form,input,button,textarea,select,meta,link,base,svg,math"
+            ).forEach(node => node.remove());
+            template.content.querySelectorAll("*").forEach(node => {
+                [...node.attributes].forEach(attr => {
+                    const name = attr.name.toLowerCase();
+                    if (name.startsWith("on") || name === "style" || name === "srcdoc") {
+                        node.removeAttribute(attr.name);
+                    } else if ((name === "href" || name === "src") && !safeExternalUrl(attr.value)) {
+                        node.removeAttribute(attr.name);
+                    }
+                });
+                if (node.tagName === "A") {
+                    node.setAttribute("rel", "noopener noreferrer");
+                    node.setAttribute("target", "_blank");
+                }
+            });
+            return template.innerHTML;
+        }
+
+        // marked 默认允许原始 HTML；统一净化后再交给所有现有 Markdown 渲染点。
+        const unsafeMarkedParse = marked.parse.bind(marked);
+        marked.parse = value => sanitizeHtml(unsafeMarkedParse(String(value == null ? "" : value)));
+
+        async function sendMessage() {
+            if (isProcessing) return;
+            const input = document.getElementById("chatInput");
+            const message = input.value.trim();
+            if (!message) return;
+            input.value = "";
+            addMessage("user", message);
+            isProcessing = true;
+            document.getElementById("sendBtn").style.display = "none";
+            document.getElementById("cancelBtn").style.display = "flex";
+            document.getElementById("typingIndicator").classList.add("show");
+
+            currentAbortController = new AbortController();
+            try {
+                const resp = await fetch("/api/chat", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ message }),
+                    signal: currentAbortController.signal
+                });
+                const data = await resp.json();
+                if (data.error) {
+                    addMessage("assistant", `错误: ${data.error}`);
+                } else {
+                    addMessage("assistant", data.response);
+                }
+            } catch (e) {
+                if (e.name === "AbortError") {
+                    addMessage("assistant", "（已取消）");
+                } else {
+                    addMessage("assistant", `网络错误: ${e.message}`);
+                }
+            } finally {
+                isProcessing = false;
+                currentAbortController = null;
+                document.getElementById("sendBtn").style.display = "flex";
+                document.getElementById("cancelBtn").style.display = "none";
+                document.getElementById("typingIndicator").classList.remove("show");
+            }
+        }
+
+        function cancelMessage() {
+            if (currentAbortController) {
+                currentAbortController.abort();
+            }
+        }
+
+        function quickAsk(text) {
+            document.getElementById("chatInput").value = text;
+            sendMessage();
+        }
+
+        async function searchStock() {
+            const symbol = document.getElementById("stockSearch").value.trim();
+            if (!symbol || symbol.length !== 6) { showToast("请输入6位股票代码"); return; }
+            quickAsk(`分析一下 ${symbol}`);
+        }
+
+        async function saveNote() {
+            const content = document.getElementById("noteContent").value.trim();
+            const stockCode = document.getElementById("noteStock").value.trim();
+            if (!content) { showToast("请输入笔记内容"); return; }
+            try {
+                const resp = await fetch("/api/knowledge/add", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ note: content, stock_code: stockCode, category: "note" })
+                });
+                const data = await resp.json();
+                if (data.success) {
+                    showToast("笔记已保存");
+                    document.getElementById("noteContent").value = "";
+                    document.getElementById("noteStock").value = "";
+                } else {
+                    showToast("保存失败: " + (data.error || "未知错误"));
+                }
+            } catch (e) {
+                showToast("保存失败: " + e.message);
+            }
+        }
+
+        function showToast(msg) {
+            const toast = document.getElementById("toast");
+            toast.textContent = msg;
+            toast.classList.add("show");
+            setTimeout(() => toast.classList.remove("show"), 3000);
+        }
+
+        function togglePortfolioEdit() {
+            const el = document.getElementById("portfolioEdit");
+            if (el.style.display === "none") {
+                el.style.display = "block";
+                loadPortfolioEditList();
+            } else {
+                el.style.display = "none";
+            }
+        }
+
+        async function loadPortfolioEditList() {
+            const resp = await fetch("/api/portfolio/list");
+            const data = await resp.json();
+            const el = document.getElementById("portfolioEditList");
+            if (!data.portfolio || data.portfolio.length === 0) {
+                el.innerHTML = "<div style='font-size:12px;color:var(--text-secondary)'>暂无持仓</div>";
+                return;
+            }
+            el.innerHTML = `<div style="font-size:11px;color:var(--text-secondary);margin-bottom:6px">成本和数量由交易账本维护；此处只调整止损/止盈。清仓请新增卖出交易。</div>` + data.portfolio.map(p => `
+                <div style="display:flex;justify-content:space-between;align-items:center;padding:7px 0;font-size:12px;border-bottom:1px solid #f1f3f4;gap:6px;flex-wrap:wrap">
+                    <span style="flex:1;min-width:130px"><b>${escapeHtml(p.name || '')}</b> (${escapeHtml(p.code || '')})<span style="display:block;font-size:10px;color:var(--text-secondary)">成本 ${p.cost} · 数量 ${p.shares}</span></span>
+                    <label style="font-size:10px;color:var(--text-secondary)">止损 <input type="number" value="${p.stop_loss ?? ''}" min="0" step="0.001" style="width:65px;padding:3px 4px;border:1px solid var(--border);border-radius:3px;font-size:11px" id="stop_${p.code}"></label>
+                    <label style="font-size:10px;color:var(--text-secondary)">止盈 <input type="number" value="${p.take_profit ?? ''}" min="0" step="0.001" style="width:65px;padding:3px 4px;border:1px solid var(--border);border-radius:3px;font-size:11px" id="take_${p.code}"></label>
+                    <button onclick="updatePosition('${p.code}')" style="padding:3px 7px;background:var(--primary);color:white;border:none;border-radius:3px;cursor:pointer;font-size:11px">保存风险线</button>
+                    <button onclick="deletePosition('${p.code}')" style="padding:3px 6px;border:1px solid var(--border);background:white;color:var(--text-secondary);border-radius:3px;cursor:pointer;font-size:11px">删除</button>
+                </div>
+            `).join("");
+        }
+
+        async function addPosition() {
+            const code = document.getElementById("addCode").value.trim();
+            const cost = document.getElementById("addCost").value;
+            const shares = document.getElementById("addShares").value;
+
+            if (!code || !cost || !shares) {
+                showToast("请填写完整信息");
+                return;
+            }
+
+            const resp = await fetch("/api/portfolio/add", {
+                method: "POST",
+                headers: {"Content-Type": "application/json"},
+                body: JSON.stringify({code, cost: parseFloat(cost), shares: parseInt(shares)})
+            });
+            const data = await resp.json();
+            if (data.success) {
+                showToast("添加成功: " + (data.item.name || code));
+                document.getElementById("addCode").value = "";
+                document.getElementById("addCost").value = "";
+                document.getElementById("addShares").value = "";
+                await refreshPortfolioDependents();
+            } else {
+                showToast(data.error || "添加失败");
+            }
+        }
+
+        async function deletePosition(code) {
+            if (!confirm(`确认删除 ${code}？`)) return;
+            const resp = await fetch("/api/portfolio/delete", {
+                method: "POST",
+                headers: {"Content-Type": "application/json"},
+                body: JSON.stringify({code})
+            });
+            const data = await resp.json();
+            if (data.success) {
+                showToast("已删除");
+                await refreshPortfolioDependents();
+            } else {
+                showToast(data.error || "删除失败");
+            }
+        }
+
+        async function updatePosition(code) {
+            const stopLoss = document.getElementById(`stop_${code}`).value;
+            const takeProfit = document.getElementById(`take_${code}`).value;
+            if (!stopLoss || !takeProfit) { showToast("请填写止损和止盈价格"); return; }
+            const resp = await fetch("/api/portfolio/update", {
+                method: "POST",
+                headers: {"Content-Type": "application/json"},
+                body: JSON.stringify({code, stop_loss: parseFloat(stopLoss), take_profit: parseFloat(takeProfit)})
+            });
+            const data = await resp.json();
+            if (data.success) {
+                showToast("风险线已更新");
+                await refreshPortfolioDependents();
+            } else {
+                showToast(data.error || "更新失败");
+            }
+        }
+
+        async function loadPortfolio() {
+            try {
+                const resp = await fetchWithTimeout("/api/portfolio");
+                const data = await resp.json();
+                const el = document.getElementById("portfolioList");
+                if (data.summary) {
+                    const lines = data.summary.split("\n").filter(l => l.trim());
+                    let html = "";
+                    let summaryLine = "";
+                    for (const line of lines) {
+                        const safeLine = escapeHtml(line.trim());
+                        const safeDetail = escapeHtml(line.slice(4));
+                        if (line.startsWith("[+]")) {
+                            html += `<div class="list-item"><span class="name">${safeDetail}</span></div>`;
+                        } else if (line.startsWith("[-]")) {
+                            html += `<div class="list-item"><span class="name">${safeDetail}</span></div>`;
+                        } else if (line.includes("总盈亏:")) {
+                            const isUp = line.includes("+");
+                            html += `<div class="list-item ${isUp ? 'up' : 'down'}" style="border-top:2px solid var(--border);margin-top:8px;padding-top:8px;font-weight:600"><span>${safeLine}</span></div>`;
+                            summaryLine = `<span class="${isUp ? 'up' : 'down'}" style="font-size:16px;font-weight:700">${safeLine}</span>`;
+                        } else if (line.includes("总投入:") || line.includes("总市值:")) {
+                            html += `<div class="list-item" style="padding-left:0"><span style="font-size:12px;color:var(--text-secondary)">${safeLine}</span></div>`;
+                        } else if (line.includes("盈亏:")) {
+                            const isUp = line.includes("+");
+                            html += `<div class="list-item" style="padding-left:12px"><span class="${isUp ? 'up' : 'down'}" style="font-size:12px;font-weight:500">${safeLine}</span></div>`;
+                        } else if (line.includes("今日涨跌:") || line.includes("今日盈亏:")) {
+                            const isUp = line.includes("+");
+                            html += `<div class="list-item" style="padding-left:12px"><span class="${isUp ? 'up' : 'down'}" style="font-size:12px">${safeLine}</span></div>`;
+                        } else if (line.includes("现价:")) {
+                            html += `<div class="list-item" style="padding-left:12px"><span style="font-size:12px;color:var(--text-secondary)">${safeLine}</span></div>`;
+                        }
+                    }
+                    el.innerHTML = html || "<div>暂无数据</div>";
+                    // Update portfolio summary on overview tab
+                    const summaryEl = document.getElementById("portfolioSummary");
+                    if (summaryEl) {
+                        summaryEl.innerHTML = summaryLine || "<span style='color:var(--text-secondary);font-size:13px'>暂无持仓数据</span>";
+                    }
+                } else {
+                    el.innerHTML = "<div>未配置持仓</div>";
+                    const summaryEl = document.getElementById("portfolioSummary");
+                    if (summaryEl) summaryEl.innerHTML = "<span style='color:var(--text-secondary);font-size:13px'>未配置持仓</span>";
+                }
+            } catch (e) {
+                const message = `加载失败：${escapeHtml(e.message || '请求异常')}`;
+                document.getElementById("portfolioList").innerHTML = `<div>${message}</div>`;
+                const summaryEl = document.getElementById("portfolioSummary");
+                if (summaryEl) summaryEl.innerHTML = `<span style="color:var(--danger);font-size:13px">${message}</span>`;
+            }
+        }
+
+        async function refreshWatchlistDependents() {
+            const tasks = [loadWatchlist(), loadSignals()];
+            if (loadedTabs.has(5)) tasks.push(loadDailyNews());
+            if (loadedTabs.has(3)) tasks.push(loadBankNews());
+            await Promise.all(tasks);
+        }
+
+        async function removeWatch(code, market = '', isPortfolio = false) {
+            const message = isPortfolio
+                ? `确认移除 ${code} 的自选设置？该标的仍是持仓，会继续显示在“持仓”分组。`
+                : `确认从自选中删除 ${code}？`;
+            if (!confirm(message)) return;
+            const resp = await fetch("/api/watchlist/delete", {
+                method: "POST",
+                headers: {"Content-Type": "application/json"},
+                body: JSON.stringify({code, market})
+            });
+            const data = await resp.json();
+            if (data.success) {
+                showToast("已从自选中删除");
+                await refreshWatchlistDependents();
+            } else {
+                showToast(data.error || "删除失败");
+            }
+        }
+
+        async function loadProfitSummary() {
+            try {
+                const resp = await fetchWithTimeout("/api/profit-summary");
+                const data = await resp.json();
+                if (!resp.ok || data.error) throw new Error(data.error || `HTTP ${resp.status}`);
+                const fmt = (v) => {
+                    const cls = v >= 0 ? 'up' : 'down';
+                    return `<span class="${cls}">${v >= 0 ? '+' : ''}${v.toFixed(2)}元</span>`;
+                };
+                document.getElementById("realizedProfit").innerHTML = fmt(data.realized);
+                document.getElementById("unrealizedProfit").innerHTML = fmt(data.unrealized);
+                document.getElementById("totalProfit").innerHTML = fmt(data.total);
+            } catch(e) {
+                const message = escapeHtml(e.message || '加载失败');
+                for (const id of ['realizedProfit', 'unrealizedProfit', 'totalProfit']) {
+                    const el = document.getElementById(id);
+                    if (el) el.innerHTML = `<span style="color:var(--danger);font-size:12px">${message}</span>`;
+                }
+            }
+        }
+
+        async function loadSignals() {
+            const el = document.getElementById("signalsList");
+            try {
+                const resp = await fetchWithTimeout("/api/signals");
+                const data = await resp.json();
+                if (!resp.ok || data.error) throw new Error(data.error || `HTTP ${resp.status}`);
+                const signals = Array.isArray(data.signals) ? data.signals : [];
+                if (signals.length === 0) {
+                    el.innerHTML = "<div style='font-size:12px;color:var(--text-secondary)'>暂无自选标的</div>";
+                    return;
+                }
+
+                const levelStyles = {
+                    critical: {color: "var(--danger)", background: "#fce8e6", label: "严重风险"},
+                    warning: {color: "#b06000", background: "#fef7e0", label: "预警"},
+                    opportunity: {color: "var(--success)", background: "#e6f4ea", label: "机会"},
+                    neutral: {color: "var(--text-secondary)", background: "#f1f3f4", label: "中性"},
+                    info: {color: "var(--text-secondary)", background: "#f1f3f4", label: "数据提示"},
+                };
+                const marketLabels = {
+                    panic: "大盘恐慌", weak: "大盘偏弱", normal: "大盘中性",
+                    strong: "大盘偏强", euphoria: "大盘偏热",
+                };
+                const finite = value => value !== null && value !== "" && Number.isFinite(Number(value));
+                const numberText = (value, digits = 2) => finite(value) ? Number(value).toFixed(digits) : "—";
+
+                const renderSignal = s => {
+                    const metrics = s.metrics && typeof s.metrics === "object" ? s.metrics : {};
+                    const style = levelStyles[s.level] || levelStyles.info;
+                    const metricItems = [
+                        `现价 ${numberText(metrics.price, 3)}`,
+                        s.position_state === "held" ? `盈亏 ${finite(metrics.pnl_pct) && Number(metrics.pnl_pct) > 0 ? "+" : ""}${numberText(metrics.pnl_pct)}%` : null,
+                        `RSI ${numberText(metrics.rsi14, 1)}`,
+                        `阶段回撤 ${numberText(metrics.drawdown_pct)}%`,
+                        finite(metrics.return_20_pct) ? `20日涨跌 ${Number(metrics.return_20_pct) > 0 ? "+" : ""}${numberText(metrics.return_20_pct)}%` : null,
+                        finite(metrics.relative_strength_20_pct) ? `相对上证 ${Number(metrics.relative_strength_20_pct) > 0 ? "+" : ""}${numberText(metrics.relative_strength_20_pct)}%` : null,
+                        finite(metrics.volatility_20_pct) ? `20日波动 ${numberText(metrics.volatility_20_pct)}%` : null,
+                        `MA20 ${numberText(metrics.ma20, 3)}`,
+                        `${metrics.ma_long_label || "长期均线"} ${numberText(metrics.ma_long, 3)}`,
+                        marketLabels[metrics.market_status] || "市场状态 —",
+                    ].filter(Boolean);
+                    return `<div style="padding:10px 12px;margin-bottom:8px;border:1px solid var(--border);border-left:4px solid ${style.color};border-radius:8px;background:var(--card-bg)">
+                        <div style="display:flex;align-items:center;justify-content:space-between;gap:8px">
+                            <div style="font-size:13px;font-weight:600">${escapeHtml(s.name || "")}（${escapeHtml(s.code || "")}）</div>
+                            <span style="flex:none;padding:1px 7px;border-radius:10px;font-size:11px;color:${style.color};background:${style.background}">${style.label}</span>
+                        </div>
+                        <div style="font-size:12px;margin-top:5px;line-height:1.6">${escapeHtml(s.signal || "暂无建议")}</div>
+                        <div style="font-size:11px;color:var(--text-secondary);margin-top:5px;line-height:1.7">${metricItems.map(escapeHtml).join(" · ")}</div>
+                    </div>`;
+                };
+                const renderGroup = (title, items) => items.length ? `
+                    <div style="font-size:12px;font-weight:600;color:var(--text-secondary);margin:10px 0 6px">${title}（${items.length}）</div>
+                    ${items.map(renderSignal).join("")}` : "";
+
+                const held = signals.filter(s => s.position_state === "held");
+                const watch = signals.filter(s => s.position_state !== "held");
+                el.innerHTML = renderGroup("持仓建议", held) + renderGroup("观察建议", watch) +
+                    `<div style="font-size:11px;color:var(--text-secondary);margin-top:8px">规则基于价格、趋势、相对强弱与波动率生成；扩大样本验证未达到65%，不展示胜率承诺，仅作客观风险提示。</div>`;
+            } catch (e) {
+                el.innerHTML = `<div style="font-size:12px;color:var(--danger)">加载失败：${escapeHtml(e.message || "请求异常")}</div>`;
+            }
+        }
+
+        let _dailyNews = [];
+        let _newsCategory = "全部";
+        let _newsMood = "";
+        let _newsSummary = null;
+
+        function renderMoodBar() {
+            if (!_newsSummary) return "";
+            const c = _newsSummary;
+            const good = (c["非常利好"] || 0) + (c["利好"] || 0);
+            const bad = (c["非常利空"] || 0) + (c["利空"] || 0);
+            const neu = c["中性"] || 0;
+            const total = good + bad + neu;
+            // 情绪只基于“持仓相关”新闻，代表对你持仓的影响；无相关新闻时明确说明
+            if (total === 0) {
+                return `<div style="border:1px solid var(--border);border-radius:8px;padding:10px 12px;margin-bottom:12px;font-size:12px;color:var(--text-secondary)">
+                    今日暂无与你持仓/自选直接相关的重要新闻</div>`;
+            }
+            const moodColor = _newsMood === "偏多" ? "var(--danger)" : (_newsMood === "偏空" ? "var(--success)" : "var(--text-secondary)");
+            const pct = v => (100 * v / total).toFixed(0);
+            const lowSample = total < 3 ? `<span style="color:#b06000;margin-left:6px">· 样本少，参考性有限</span>` : "";
+            return `<div style="border:1px solid var(--border);border-radius:8px;padding:10px 12px;margin-bottom:12px">
+                <div style="font-size:12px;margin-bottom:6px">
+                    持仓相关情绪：<span style="color:${moodColor};font-weight:700">${_newsMood}</span>
+                    <span style="color:var(--text-secondary);margin-left:8px">利好 ${good} · 中性 ${neu} · 利空 ${bad}（基于 ${total} 条相关新闻）</span>${lowSample}
+                </div>
+                <div style="display:flex;height:8px;border-radius:4px;overflow:hidden;background:#f1f3f4">
+                    <div style="width:${pct(good)}%;background:var(--danger)"></div>
+                    <div style="width:${pct(neu)}%;background:#dadce0"></div>
+                    <div style="width:${pct(bad)}%;background:var(--success)"></div>
+                </div>
+            </div>`;
+        }
+
+        async function loadDailyNews() {
+            const el = document.getElementById("dailyNewsList");
+            el.innerHTML = '<div class="loading">加载中</div>';
+            try {
+                const resp = await fetch("/api/daily-news?count=50&ai=1&push=0");
+                const data = await resp.json();
+                if (data.error) throw new Error(data.error);
+                _dailyNews = data.news || [];
+                _newsMood = data.mood || "";
+                _newsSummary = data.sentiment_summary || null;
+                const rel = data.related_count || 0;
+                document.getElementById("newsUpdated").textContent =
+                    (data.updated ? `更新于 ${data.updated}` : "") + (rel ? ` · 相关 ${rel} 条` : "");
+                renderNewsCategories();
+                renderDailyNews();
+            } catch (e) {
+                el.innerHTML = `<div style="font-size:12px;color:var(--danger);padding:8px">加载失败: ${escapeHtml(e.message)}</div>`;
+            }
+        }
+
+        function renderNewsCategories() {
+            const counts = { "全部": _dailyNews.length };
+            _dailyNews.forEach(n => {
+                const category = String(n.category || "其他");
+                counts[category] = (counts[category] || 0) + 1;
+            });
+            const nav = document.getElementById("newsCategories");
+            nav.innerHTML = Object.keys(counts).map(cat => {
+                const active = cat === _newsCategory;
+                return `<button data-news-category="${escapeHtml(cat)}" class="quick-btn"
+                    style="${active ? 'background:var(--primary-light);border-color:var(--primary);color:var(--primary)' : ''}">
+                    ${escapeHtml(cat)} ${counts[cat]}</button>`;
+            }).join("");
+            nav.querySelectorAll("[data-news-category]").forEach(button => {
+                button.addEventListener("click", () => setNewsCategory(button.dataset.newsCategory));
+            });
+        }
+
+        function setNewsCategory(cat) {
+            _newsCategory = cat;
+            renderNewsCategories();
+            renderDailyNews();
+        }
+
+        // A股习惯：利好红、利空绿；“非常”档更深、加粗、带图标
+        const SENTIMENT_STYLE = {
+            "非常利好": "background:var(--danger);color:#fff",
+            "利好": "background:#fce8e6;color:var(--danger)",
+            "中性": "background:#f1f3f4;color:var(--text-secondary)",
+            "利空": "background:#e6f4ea;color:var(--success)",
+            "非常利空": "background:var(--success);color:#fff",
+        };
+
+        function isStrong(s) { return s === "非常利好" || s === "非常利空"; }
+
+        function sentimentTag(s) {
+            if (!s) return "";
+            const style = SENTIMENT_STYLE[s] || SENTIMENT_STYLE["中性"];
+            const icon = isStrong(s) ? "⚠ " : "";
+            return `<span style="${style};padding:1px 7px;border-radius:10px;font-size:11px;font-weight:600;margin-left:6px">${icon}${escapeHtml(s)}</span>`;
+        }
+
+        function newsAlertRow(n) {
+            const good = n.sentiment === "非常利好";
+            const color = good ? "var(--danger)" : "var(--success)";
+            const url = safeExternalUrl(n.url);
+            const title = escapeHtml(n.title || "");
+            const titleInner = url
+                ? `<a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer" style="color:${color};text-decoration:none">${title}</a>`
+                : title;
+            const who = n.matched && n.matched.length
+                ? `[${n.matched.map(escapeHtml).join("/")}] ` : "";
+            const reason = n.reason
+                ? `<span style="color:var(--text-secondary)"> · ${escapeHtml(n.reason)}</span>` : "";
+            return `<div style="font-size:12px;line-height:1.7;color:var(--text)">
+                <span style="color:${color};font-weight:700">${good ? "▲" : "▼"} ${escapeHtml(n.sentiment)}</span>
+                ${who}${titleInner}${reason}</div>`;
+        }
+
+        function renderNewsAlerts(list) {
+            const strong = list.filter(n => isStrong(n.sentiment));
+            if (strong.length === 0) return "";
+            // 语义区分：持仓相关重磅（对你的影响）vs 全市场重磅（市场大事，仅参考）
+            const hold = strong.filter(n => n.related);
+            const market = strong.filter(n => !n.related);
+            let html = "";
+            if (hold.length) {
+                html += `<div style="border:1px solid #f5c6cb;background:#fff8f7;border-radius:8px;padding:10px 12px;margin-bottom:10px">
+                    <div style="font-size:12px;font-weight:700;color:var(--danger);margin-bottom:6px">⚠ 持仓相关重磅（${hold.length}）</div>
+                    ${hold.map(newsAlertRow).join("")}</div>`;
+            }
+            if (market.length) {
+                html += `<div style="border:1px solid var(--border);background:#fafafa;border-radius:8px;padding:10px 12px;margin-bottom:10px">
+                    <div style="font-size:12px;font-weight:700;color:var(--text-secondary);margin-bottom:6px">📰 市场大事（${market.length}，与持仓无直接关系）</div>
+                    ${market.map(newsAlertRow).join("")}</div>`;
+            }
+            return html;
+        }
+
+        function renderDailyNews() {
+            const el = document.getElementById("dailyNewsList");
+            const q = (document.getElementById("newsSearch").value || "").trim().toLowerCase();
+            const onlyRelated = document.getElementById("newsOnlyRelated").checked;
+
+            let list = _dailyNews;
+            if (_newsCategory !== "全部") list = list.filter(n => n.category === _newsCategory);
+            if (onlyRelated) list = list.filter(n => n.related);
+            if (q) list = list.filter(n =>
+                n.title.toLowerCase().includes(q) || (n.summary || "").toLowerCase().includes(q));
+
+            if (list.length === 0) {
+                el.innerHTML = '<div style="font-size:12px;color:var(--text-secondary);padding:8px">没有匹配的新闻</div>';
+                return;
+            }
+
+            const cards = list.map(n => {
+                const strong = isStrong(n.sentiment);
+                const url = safeExternalUrl(n.url);
+                const title = escapeHtml(n.title || "");
+                const titleInner = url
+                    ? `<a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer" style="color:var(--text);text-decoration:none">${title}</a>`
+                    : title;
+                const relTag = n.related
+                    ? `<span style="background:var(--primary-light);color:var(--primary);padding:1px 7px;border-radius:10px;font-size:11px;font-weight:600;margin-right:6px">${(n.matched || []).map(escapeHtml).join("/")}</span>`
+                    : "";
+                const catTag = `<span style="color:var(--text-secondary);font-size:11px;background:#f1f3f4;padding:1px 6px;border-radius:8px">${escapeHtml(n.category || "其他")}</span>`;
+                const reasonHtml = n.reason
+                    ? `<span style="font-size:11px;color:var(--text-secondary)"> · ${escapeHtml(n.reason)}</span>`
+                    : "";
+                const summary = n.summary
+                    ? `<div style="font-size:12px;color:var(--text-secondary);margin-top:3px;line-height:1.5">${escapeHtml(n.summary)}</div>`
+                    : "";
+                const imgUrl = safeExternalUrl(n.img);
+                const img = imgUrl
+                    ? `<img src="${escapeHtml(imgUrl)}" alt="" loading="lazy" style="width:64px;height:48px;object-fit:cover;border-radius:6px;flex-shrink:0" onerror="this.style.display='none'">`
+                    : "";
+                const meta = [(n.ago || n.time), n.source].filter(Boolean).map(escapeHtml).join(" · ");
+                // 样式优先级：非常利好/利空 > 持仓相关 > 普通
+                let wrapStyle = "padding:10px 0;border-bottom:1px solid #f1f3f4";
+                if (strong) {
+                    const c = n.sentiment === "非常利好" ? "var(--danger)" : "var(--success)";
+                    const bg = n.sentiment === "非常利好" ? "#fff6f5" : "#f4faf5";
+                    wrapStyle = `padding:10px 8px;border-bottom:1px solid #f1f3f4;border-left:4px solid ${c};background:${bg}`;
+                } else if (n.related) {
+                    wrapStyle = "padding:10px 0 10px 8px;border-bottom:1px solid #f1f3f4;border-left:3px solid var(--primary);background:#f8fbff";
+                }
+                const titleWeight = strong ? "font-weight:700;" : "";
+                return `
+                    <div style="${wrapStyle}">
+                        <div style="display:flex;gap:10px">
+                            <div style="flex:1">
+                                <div style="font-size:13px;line-height:1.5;${titleWeight}">${relTag}${titleInner}${sentimentTag(n.sentiment)}${reasonHtml}</div>
+                                ${summary}
+                                <div style="font-size:11px;color:var(--text-secondary);margin-top:4px;display:flex;align-items:center;gap:8px">${catTag}<span>${meta}</span></div>
+                            </div>
+                            ${img}
+                        </div>
+                    </div>`;
+            }).join("");
+
+            el.innerHTML = renderMoodBar() + renderNewsAlerts(list) + cards;
+        }
+
+        async function loadBankNews() {
+            try {
+                const resp = await fetch("/api/bank-sector");
+                const data = await resp.json();
+                const el = document.getElementById("sectorDynamics");
+                if (data.error) throw new Error(data.error);
+
+                const sectors = data.all_sectors || [data];
+                if (sectors.length === 0) {
+                    el.innerHTML = '<div style="font-size:12px;color:var(--text-secondary)">暂无板块数据</div>';
+                    return;
+                }
+
+                window._sectorData = sectors;
+
+                let html = '<div style="display:flex;gap:6px;margin-bottom:12px;flex-wrap:wrap">';
+                sectors.forEach((sector, i) => {
+                    html += `<button onclick="showSectorTab(${i})" class="quick-btn sector-tab" data-idx="${i}" style="${i===0?'background:var(--primary-light);border-color:var(--primary);color:var(--primary)':''}">${escapeHtml(sector.name || '未命名板块')}</button>`;
+                });
+                html += '</div>';
+                html += '<div id="sectorTabContent"></div>';
+                el.innerHTML = html;
+
+                showSectorTab(0);
+            } catch (e) {
+                document.getElementById("sectorDynamics").innerHTML = `<div style="font-size:12px;color:var(--text-secondary)">加载失败</div>`;
+            }
+        }
+
+        function showSectorTab(idx) {
+            const sectors = window._sectorData || [];
+            if (!sectors[idx]) return;
+            const sector = sectors[idx];
+
+            document.querySelectorAll(".sector-tab").forEach((btn, i) => {
+                if (i === idx) {
+                    btn.style.background = "var(--primary-light)";
+                    btn.style.borderColor = "var(--primary)";
+                    btn.style.color = "var(--primary)";
+                } else {
+                    btn.style.background = "white";
+                    btn.style.borderColor = "var(--border)";
+                    btn.style.color = "var(--text-secondary)";
+                }
+            });
+
+            let html = "";
+            if (sector.sector) {
+                const s = sector.sector;
+                const cls = s.change_pct >= 0 ? "up" : "down";
+                html += `<div class="list-item"><span class="name">板块涨跌</span><span class="${cls}">${s.change_pct >= 0 ? '+' : ''}${s.change_pct.toFixed(2)}%</span></div>`;
+            }
+            if (sector.key_stocks && sector.key_stocks.length > 0) {
+                for (const stock of sector.key_stocks) {
+                    const cls = stock.change_pct >= 0 ? "up" : "down";
+                    html += `<div class="list-item"><span class="name" style="font-size:12px">${escapeHtml(stock.name || stock.code || '')}</span><span class="${cls}" style="font-size:12px">${stock.change_pct >= 0 ? '+' : ''}${stock.change_pct.toFixed(2)}%</span></div>`;
+                }
+            }
+            html += `<div style="border-top:1px solid var(--border);margin-top:8px;padding-top:8px">`;
+            if (sector.news && sector.news.length > 0) {
+                for (const item of sector.news) {
+                    html += `<div style="font-size:12px;color:var(--text-secondary);padding:4px 0">${escapeHtml(item)}</div>`;
+                }
+            } else {
+                html += `<div style="font-size:12px;color:var(--text-secondary);padding:4px 0">暂无该板块相关新闻</div>`;
+            }
+            html += `</div>`;
+            if (sector.analysis) {
+                html += `<div style="border-top:1px solid var(--border);margin-top:8px;padding-top:8px;font-size:13px;font-weight:500;color:var(--text)">📊 ${escapeHtml(sector.analysis)}</div>`;
+            }
+            document.getElementById("sectorTabContent").innerHTML = html || '<div style="font-size:12px;color:var(--text-secondary)">暂无数据</div>';
+        }
+
+        function showTradeForm() {
+            const el = document.getElementById("tradeForm");
+            el.style.display = el.style.display === "none" ? "block" : "none";
+        }
+
+        let tradeRequestPending = false;
+
+        async function addTrade() {
+            if (tradeRequestPending) return;
+            const action = document.getElementById("tradeAction").value;
+            const code = document.getElementById("tradeCode").value.trim();
+            const price = document.getElementById("tradePrice").value;
+            const shares = document.getElementById("tradeShares").value;
+            if (!code || !price || !shares) { showToast("请填写完整"); return; }
+            const button = document.querySelector('#tradeForm button[onclick="addTrade()"]');
+            try {
+                tradeRequestPending = true;
+                if (button) { button.disabled = true; button.textContent = "保存中..."; }
+                const resp = await fetch("/api/trades/add", {
+                    method: "POST",
+                    headers: {"Content-Type": "application/json"},
+                    body: JSON.stringify({code, action, price: parseFloat(price), shares: parseInt(shares)})
+                });
+                const data = await resp.json();
+                if (!resp.ok || !data.success) throw new Error(data.error || "记录失败");
+                showToast((action === "buy" ? "买入" : "卖出") + "记录已保存");
+                document.getElementById("tradeCode").value = "";
+                document.getElementById("tradePrice").value = "";
+                document.getElementById("tradeShares").value = "";
+                await refreshPortfolioDependents();
+            } catch (e) {
+                showToast(e.message || "记录失败");
+            } finally {
+                tradeRequestPending = false;
+                if (button) { button.disabled = false; button.textContent = "记录"; }
+            }
+        }
+
+        async function loadTrades() {
+            try {
+                const resp = await fetch("/api/trades");
+                const data = await resp.json();
+                const el = document.getElementById("tradesList");
+                if (!el) return;
+                if (!data.trades || data.trades.length === 0) {
+                    el.innerHTML = "<div style='font-size:12px;color:var(--text-secondary)'>暂无交易记录</div>";
+                    return;
+                }
+
+                // Get unique stock codes for filter
+                const codes = [...new Set(data.trades.map(t => t.code))];
+                window._allTrades = data.trades;
+
+                let filterHtml = '<div style="display:flex;gap:4px;margin-bottom:8px;flex-wrap:wrap">';
+                filterHtml += `<button onclick="filterTrades('')" class="quick-btn trade-filter" style="font-size:11px;background:var(--primary-light);border-color:var(--primary);color:var(--primary)">全部</button>`;
+                for (const code of codes) {
+                    const name = data.trades.find(t => t.code === code)?.name || code;
+                    filterHtml += `<button onclick="filterTrades('${code}')" class="quick-btn trade-filter" style="font-size:11px">${escapeHtml(name)}</button>`;
+                }
+                filterHtml += '</div>';
+
+                el.innerHTML = filterHtml + '<div id="tradesContent"></div>';
+                filterTrades('');
+            } catch(e) {
+                const el = document.getElementById("tradesList");
+                if (el) el.innerHTML = "<div>加载失败: " + escapeHtml(e.message || '') + "</div>";
+            }
+        }
+
+        async function deleteTrade(index, id = '') {
+            if (!confirm("确认删除这条记录？持仓将自动重算。")) return;
+            const resp = await fetch("/api/trades/delete", {
+                method: "POST",
+                headers: {"Content-Type": "application/json"},
+                body: JSON.stringify({index, id})
+            });
+            const data = await resp.json();
+            if (resp.ok && data.success) {
+                showToast("已删除，持仓已重算");
+                await refreshPortfolioDependents();
+            } else {
+                showToast(data.error || "删除失败");
+            }
+        }
+
+        function editTrade(index, id, action, code, price, shares) {
+            const row = document.getElementById(`trade-row-${index}`);
+            if (!row) return;
+            row.innerHTML = `
+                <div style="display:flex;gap:4px;align-items:center;flex-wrap:wrap">
+                    <select id="edit-action-${index}" style="padding:3px;border:1px solid var(--border);border-radius:3px;font-size:11px">
+                        <option value="buy" ${action==='buy'?'selected':''}>买入</option>
+                        <option value="sell" ${action==='sell'?'selected':''}>卖出</option>
+                    </select>
+                    <input id="edit-code-${index}" value="${code}" style="width:55px;padding:3px;border:1px solid var(--border);border-radius:3px;font-size:11px">
+                    <input id="edit-price-${index}" type="number" step="0.001" value="${price}" style="width:55px;padding:3px;border:1px solid var(--border);border-radius:3px;font-size:11px">
+                    <input id="edit-shares-${index}" type="number" value="${shares}" style="width:55px;padding:3px;border:1px solid var(--border);border-radius:3px;font-size:11px">
+                    <button onclick="saveEditTrade(${index}, '${id}')" style="padding:3px 8px;background:var(--primary);color:white;border:none;border-radius:3px;cursor:pointer;font-size:11px">保存</button>
+                    <button onclick="loadTrades()" style="padding:3px 8px;border:1px solid var(--border);border-radius:3px;background:white;cursor:pointer;font-size:11px">取消</button>
+                </div>
+            `;
+        }
+
+        async function saveEditTrade(index, id = '') {
+            const action = document.getElementById(`edit-action-${index}`).value;
+            const code = document.getElementById(`edit-code-${index}`).value.trim();
+            const price = parseFloat(document.getElementById(`edit-price-${index}`).value);
+            const shares = parseInt(document.getElementById(`edit-shares-${index}`).value);
+            if (!code || !price || !shares) { showToast("请填写完整"); return; }
+
+            const resp = await fetch("/api/trades/edit", {
+                method: "POST",
+                headers: {"Content-Type": "application/json"},
+                body: JSON.stringify({index, id, action, code, price, shares})
+            });
+            const data = await resp.json();
+            if (resp.ok && data.success) {
+                showToast("已修改，持仓已重算");
+                await refreshPortfolioDependents();
+            } else {
+                showToast(data.error || "修改失败");
+            }
+        }
+
+        function filterTrades(code) {
+            const trades = window._allTrades || [];
+            const filtered = code ? trades.filter(t => t.code === code) : trades;
+
+            // Update button styles
+            document.querySelectorAll(".trade-filter").forEach((btn, i) => {
+                if ((code === '' && i === 0) || btn.textContent.includes(code)) {
+                    btn.style.background = "var(--primary-light)";
+                    btn.style.borderColor = "var(--primary)";
+                    btn.style.color = "var(--primary)";
+                } else {
+                    btn.style.background = "white";
+                    btn.style.borderColor = "var(--border)";
+                    btn.style.color = "var(--text-secondary)";
+                }
+            });
+
+            const el = document.getElementById("tradesContent");
+            if (!filtered.length) {
+                el.innerHTML = "<div style='font-size:12px;color:var(--text-secondary)'>无记录</div>";
+                return;
+            }
+            el.innerHTML = filtered.map(t => {
+                return `
+                <div class="list-item" id="trade-row-${t._index}">
+                    <span style="font-size:12px">
+                        <span style="color:${t.action==='buy'?'var(--danger)':'var(--success)'};font-weight:500">${t.action==='buy'?'买入':'卖出'}</span>
+                        ${escapeHtml(t.name || '')}(${escapeHtml(t.code || '')}) ${t.shares}份 @${t.price}
+                        ${t.profit !== undefined ? `<span style="margin-left:6px;font-weight:500;color:${t.profit>=0?'var(--danger)':'var(--success)'}">${t.profit>=0?'+':''}${t.profit}元(${t.profit_pct>=0?'+':''}${t.profit_pct}%)</span>` : ''}
+                    </span>
+                    <span style="font-size:11px;color:var(--text-secondary)">
+                        ${escapeHtml(t.date || '')}
+                        <button onclick="editTrade(${t._index}, '${t.id || ''}', '${t.action}', '${t.code}', ${t.price}, ${t.shares})" style="margin-left:4px;padding:1px 4px;border:1px solid var(--border);border-radius:3px;background:white;cursor:pointer;font-size:10px;color:var(--primary)">改</button>
+                        <button onclick="deleteTrade(${t._index}, '${t.id || ''}')" style="margin-left:2px;padding:1px 4px;border:1px solid var(--border);border-radius:3px;background:white;cursor:pointer;font-size:10px;color:var(--text-secondary)">×</button>
+                    </span>
+                </div>`;
+            }).join("");
+        }
+
+        document.addEventListener("DOMContentLoaded", () => {
+            showTab(0);
+            loadChatHistory();
+            loadAiBalance();
+            document.querySelector('.tab-bar')?.addEventListener('keydown', event => {
+                if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+                const buttons = [...document.querySelectorAll('.tab-btn')];
+                const current = buttons.indexOf(document.activeElement);
+                let next = current;
+                if (event.key === 'ArrowLeft') next = (current - 1 + buttons.length) % buttons.length;
+                if (event.key === 'ArrowRight') next = (current + 1) % buttons.length;
+                if (event.key === 'Home') next = 0;
+                if (event.key === 'End') next = buttons.length - 1;
+                event.preventDefault();
+                showTab(next);
+                buttons[next]?.focus();
+            });
+            scheduleVisibleRefresh(loadMarketOverview, 3 * 60 * 1000, [0]);
+            scheduleVisibleRefresh(loadSectorFlow, 5 * 60 * 1000, [0]);
+            scheduleVisibleRefresh(loadPortfolio, 90 * 1000, [0, 1]);
+            scheduleVisibleRefresh(loadProfitSummary, 90 * 1000, [0, 1]);
+            scheduleVisibleRefresh(loadSignals, 5 * 60 * 1000, [2]);
+            // 与后端15秒行情缓存对齐，避免自选涨跌幅长期滞后。
+            scheduleVisibleRefresh(loadWatchlist, 15 * 1000, [2]);
+            document.addEventListener('visibilitychange', () => {
+                const watchTab = document.getElementById('tab-2');
+                if (!document.hidden && loadedTabs.has(2) && watchTab?.classList.contains('active')) {
+                    runLoader(window.loadWatchlist, 'loadWatchlist');
+                }
+            });
+            scheduleVisibleRefresh(loadBankNews, 10 * 60 * 1000, [3]);
+            scheduleVisibleRefresh(loadDailyNews, 10 * 60 * 1000, [5]);
+        });
+
+        document.getElementById("stockSearch").addEventListener("keydown", (e) => {
+            if (e.key === "Enter") searchStock();
+        });
+
+        // 桌面 WebView 不提供浏览器原生缩放，使用 50% 个性化基准实现 Ctrl+滚轮。
+        const DEFAULT_PAGE_ZOOM = 0.5;
+        let pageZoom = DEFAULT_PAGE_ZOOM;
+
+        function applyPageZoom(value) {
+            pageZoom = Math.min(2, Math.max(0.25, Math.round(value * 100) / 100));
+            document.body.style.zoom = `${pageZoom * 100}%`;
+        }
+
+        document.addEventListener('wheel', event => {
+            if (!event.ctrlKey) return;
+            event.preventDefault();
+            applyPageZoom(pageZoom * (event.deltaY < 0 ? 1.1 : 1 / 1.1));
+        }, {passive: false});
+
+        document.addEventListener('keydown', event => {
+            if (!event.ctrlKey) return;
+            if (event.key === '+' || event.key === '=') {
+                event.preventDefault();
+                applyPageZoom(pageZoom * 1.1);
+            } else if (event.key === '-') {
+                event.preventDefault();
+                applyPageZoom(pageZoom / 1.1);
+            } else if (event.key === '0') {
+                event.preventDefault();
+                applyPageZoom(DEFAULT_PAGE_ZOOM);
+            }
+        });
+    </script>
+    <style>
+        .insight-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; }
+        .metric-grid { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:8px; margin:10px 0; }
+        .metric-box { background:#f7f9fc; border:1px solid var(--border); border-radius:7px; padding:9px; }
+        .metric-box .label { font-size:10px; color:var(--text-secondary); }
+        .metric-box .value { font-size:15px; font-weight:700; margin-top:3px; }
+        .progress-track { height:7px; background:#eef1f4; border-radius:5px; overflow:hidden; }
+        .progress-fill { height:100%; border-radius:5px; background:var(--primary); }
+        .tag { display:inline-block; padding:1px 7px; border-radius:10px; background:#f1f3f4; color:var(--text-secondary); font-size:10px; margin-right:4px; }
+        .watch-card { padding:10px 0; border-bottom:1px solid #f1f3f4; }
+        .watch-bulk-grid { display:grid; grid-template-columns:80px minmax(130px,1fr) repeat(4,75px); gap:5px; }
+        .watch-meta { color:var(--text-secondary); font-size:11px; margin-top:5px; line-height:1.6; }
+        .link-name { cursor:pointer; color:var(--text); }
+        .link-name:hover { color:var(--primary); }
+        .stock-modal { display:none; position:fixed; inset:0; z-index:2000; background:rgba(20,28,38,.45); align-items:center; justify-content:center; padding:18px; }
+        .stock-modal.open { display:flex; }
+        .stock-modal-panel { width:min(820px,96vw); max-height:90vh; overflow:auto; background:#fff; border-radius:12px; box-shadow:0 18px 60px rgba(0,0,0,.2); padding:18px; }
+        .sparkline { width:100%; height:180px; background:linear-gradient(#fafcff,#fff); border:1px solid var(--border); border-radius:8px; }
+        .alert-row { padding:9px 0; border-bottom:1px solid #f1f3f4; }
+        .alert-critical { border-left:3px solid var(--danger); padding-left:8px; }
+        .alert-warning { border-left:3px solid #f9ab00; padding-left:8px; }
+        .alert-info { border-left:3px solid var(--primary); padding-left:8px; }
+
+        /* 页面纵向长度由左侧数据栏决定；AI 面板只在自身区域内滚动。 */
+        .main-layout {
+            height: auto;
+            min-height: calc(100vh - 57px);
+            align-items: start;
+        }
+        .data-panel {
+            height: auto;
+            min-height: calc(100vh - 57px);
+            overflow: visible;
+        }
+        .tab-content {
+            flex: 1 0 auto;
+            overflow-y: visible;
+        }
+        .chat-panel {
+            position: relative;
+            top: auto;
+            align-self: stretch;
+            height: 100%;
+            min-height: calc(100vh - 57px);
+            max-height: none;
+            overflow: hidden;
+        }
+        @media (max-width:1024px) {
+            .main-layout { min-height: 0; }
+            .data-panel { min-height: 0; }
+            .chat-panel {
+                position: static;
+                height: 50vh;
+                min-height: 50vh;
+                max-height: 50vh;
+            }
+        }
+        @media (max-width:700px) {
+            .insight-grid,.metric-grid { grid-template-columns:1fr 1fr; }
+            .tab-bar { padding:10px 12px 8px; }
+            .tab-content { padding:12px; }
+            .watch-bulk-grid { grid-template-columns:1fr 1fr; }
+        }
+    </style>
+
+    <div class="stock-modal" id="stockDetailModal" role="dialog" aria-modal="true" aria-labelledby="stockDetailTitle" tabindex="-1" onclick="if(event.target===this) closeStockDetail()">
+        <div class="stock-modal-panel">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+                <div id="stockDetailTitle" style="font-size:17px;font-weight:700">个股详情</div>
+                <button aria-label="关闭个股详情" onclick="closeStockDetail()" style="border:none;background:none;font-size:22px;cursor:pointer;color:var(--text-secondary)">×</button>
+            </div>
+            <div id="stockDetailBody"><div class="loading">加载中</div></div>
+        </div>
+    </div>
+
+    <script>
+        function escHtml(value) {
+            return String(value == null ? "" : value).replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
+        }
+
+        function safeSecurityCode(value) {
+            const code = String(value == null ? '' : value).trim();
+            return /^\d{5,6}$/.test(code) ? code : '';
+        }
+
+        function safeMarket(value) {
+            const market = String(value == null ? '' : value).toLowerCase();
+            return ['sh', 'sz', 'bj', 'hk'].includes(market) ? market : '';
+        }
+
+        async function refreshPortfolioDependents() {
+            const tasks = [
+                loadPortfolio(), loadTrades(), loadProfitSummary(), loadWatchlist(), loadSignals(),
+                loadPortfolioHealth(), loadAttribution(), loadAlerts(),
+            ];
+            const editor = document.getElementById('portfolioEditList');
+            if (editor && editor.offsetParent !== null) tasks.push(loadPortfolioEditList());
+            if (loadedTabs.has(3)) tasks.push(loadBankNews());
+            if (loadedTabs.has(5)) tasks.push(loadDailyNews());
+            await Promise.allSettled(tasks);
+        }
+
+        function fmtNum(value, digits=2) {
+            const n = Number(value);
+            return Number.isFinite(n) ? n.toFixed(digits) : "--";
+        }
+
+        function pnlHtml(value, suffix="") {
+            const n = Number(value || 0);
+            return `<span class="${n >= 0 ? 'up' : 'down'}">${n >= 0 ? '+' : ''}${fmtNum(n)}${suffix}</span>`;
+        }
+
+        window.searchStock = async function() {
+            const symbol = document.getElementById("stockSearch").value.trim();
+            if (!/^\d{5,6}$/.test(symbol)) { showToast("请输入5位港股或6位A股/ETF代码"); return; }
+            await openStockDetail(symbol);
+        };
+
+        window.openStockDetail = async function(symbol, market='') {
+            const modal = document.getElementById("stockDetailModal");
+            const body = document.getElementById("stockDetailBody");
+            modal.classList.add("open");
+            modal.focus();
+            body.innerHTML = '<div class="loading">正在加载行情与技术指标</div>';
+            try {
+                const marketQuery = market ? `?market=${encodeURIComponent(market)}` : '';
+                const resp = await fetch(`/api/stock/${encodeURIComponent(symbol)}/detail${marketQuery}`);
+                const data = await resp.json();
+                if (!resp.ok || data.error) throw new Error(data.error || "加载失败");
+                const s = data.stock, i = data.indicators || {};
+                document.getElementById("stockDetailTitle").textContent = `${s.name} (${s.code}) · ${s.market}`;
+                const closes = (data.klines || []).map(x => x.close);
+                let chart = '<div style="font-size:12px;color:var(--text-secondary);padding:20px">暂无K线数据</div>';
+                if (closes.length > 1) {
+                    const min = Math.min(...closes), max = Math.max(...closes), span = max - min || 1;
+                    const points = closes.map((v, idx) => `${idx * 760 / (closes.length - 1)},${170 - (v - min) * 150 / span}`).join(' ');
+                    const color = closes[closes.length - 1] >= closes[0] ? '#d93025' : '#188038';
+                    chart = `<svg class="sparkline" viewBox="0 0 760 180" preserveAspectRatio="none"><polyline fill="none" stroke="${color}" stroke-width="2.5" points="${points}"/></svg>`;
+                }
+                const holding = data.holding ? `<div style="margin-top:10px;padding:10px;background:#f8fbff;border-radius:7px;font-size:12px">
+                    <b>持仓</b>：${data.holding.shares} 份 · 成本 ${fmtNum(data.holding.cost,3)} · 市值 ${fmtNum(data.holding.market_value)} · ${pnlHtml(data.holding.pnl,'元')} (${pnlHtml(data.holding.pnl_pct,'%')})
+                    · 止损 ${fmtNum(data.holding.stop_loss,3)} · 止盈 ${fmtNum(data.holding.take_profit,3)}</div>` : '';
+                const watch = data.watch ? `<div style="margin-top:8px;font-size:12px;color:var(--text-secondary)"><span class="tag">${escHtml(data.watch.group || '默认')}</span>${escHtml(data.watch.reason || '尚未填写关注理由')}</div>` : '';
+                body.innerHTML = `
+                    <div style="display:flex;align-items:end;gap:12px"><span style="font-size:25px;font-weight:700">${fmtNum(s.price,3)}</span>${pnlHtml(s.change_pct,'%')}<span style="font-size:11px;color:var(--text-secondary)">${escHtml(s.market)}</span></div>
+                    <div class="metric-grid">
+                        <div class="metric-box"><div class="label">今开 / 昨收</div><div class="value">${fmtNum(s.open,3)} / ${fmtNum(s.prev_close,3)}</div></div>
+                        <div class="metric-box"><div class="label">最高 / 最低</div><div class="value">${fmtNum(s.high,3)} / ${fmtNum(s.low,3)}</div></div>
+                        <div class="metric-box"><div class="label">PE / PB</div><div class="value">${fmtNum(s.pe)} / ${fmtNum(s.pb)}</div></div>
+                        <div class="metric-box"><div class="label">换手率</div><div class="value">${fmtNum(s.turnover)}%</div></div>
+                    </div>
+                    ${chart}
+                    <div class="metric-grid">
+                        <div class="metric-box"><div class="label">RSI(14)</div><div class="value">${fmtNum(i.rsi14)}</div></div>
+                        <div class="metric-box"><div class="label">MA20</div><div class="value">${fmtNum(i.ma20,3)}</div></div>
+                        <div class="metric-box"><div class="label">MA60</div><div class="value">${fmtNum(i.ma60,3)}</div></div>
+                        <div class="metric-box"><div class="label">阶段回撤</div><div class="value">${fmtNum(i.drawdown_pct)}%</div></div>
+                    </div>
+                    <div style="font-size:12px;line-height:1.8"><b>客观观察：</b>${(data.observations || []).map(escHtml).join('；') || '指标数据不足'}</div>
+                    ${holding}${watch}`;
+            } catch (e) {
+                body.innerHTML = `<div style="color:var(--danger);font-size:13px;padding:15px">${escHtml(e.message)}</div>`;
+            }
+        };
+
+        window.closeStockDetail = function() { document.getElementById("stockDetailModal").classList.remove("open"); };
+
+        function formatWatchAmount(value) {
+            const amount = Number(value);
+            if (!Number.isFinite(amount) || amount <= 0) return '--';
+            return amount >= 10000 ? `${(amount / 10000).toFixed(2)}亿` : `${amount.toFixed(0)}万`;
+        }
+
+        window._watchlistView = window._watchlistView || {group: 'all', filter: 'all', sort: 'manual'};
+
+        window.updateWatchlistView = function() {
+            window._watchlistView = {
+                group: document.getElementById('watchGroupFilter')?.value || 'all',
+                filter: document.getElementById('watchStateFilter')?.value || 'all',
+                sort: document.getElementById('watchSort')?.value || 'manual',
+            };
+            renderWatchlist();
+        };
+
+        window.renderWatchlist = function() {
+            const el = document.getElementById('watchlistStocks');
+            const allItems = [...(window._watchlistItems || [])];
+            const meta = window._watchlistMeta || {};
+            const view = window._watchlistView || {group: 'all', filter: 'all', sort: 'manual'};
+            if (!allItems.length) {
+                el.innerHTML = "<div style='font-size:12px;color:var(--text-secondary)'>暂无自选股</div>";
+                return;
+            }
+
+            const option = (value, label, current) => `<option value="${escHtml(value)}" ${current === value ? 'selected' : ''}>${escHtml(label)}</option>`;
+            const displayGroup = item => item.display_group || (item.is_portfolio ? '持仓' : (item.group || '默认'));
+            const groupsAvailable = [...new Set(allItems.map(displayGroup))].sort((a, b) => a.localeCompare(b, 'zh-CN'));
+            let items = allItems.filter(item => {
+                if (view.group !== 'all' && displayGroup(item) !== view.group) return false;
+                if (view.filter === 'held') return item.is_portfolio;
+                if (view.filter === 'watch') return !item.is_portfolio;
+                if (view.filter === 'alerts') return (item.alerts || []).length > 0;
+                if (view.filter === 'up') return item.quote_available && item.change_pct > 0;
+                if (view.filter === 'down') return item.quote_available && item.change_pct < 0;
+                if (view.filter === 'unavailable') return !item.quote_available;
+                return true;
+            });
+
+            const numeric = (item, key, fallback) => {
+                if (item[key] == null || item[key] === '') return fallback;
+                return Number.isFinite(Number(item[key])) ? Number(item[key]) : fallback;
+            };
+            const comparators = {
+                change_desc: (a, b) => numeric(b, 'change_pct', -Infinity) - numeric(a, 'change_pct', -Infinity),
+                change_asc: (a, b) => numeric(a, 'change_pct', Infinity) - numeric(b, 'change_pct', Infinity),
+                amount_desc: (a, b) => numeric(b, 'amount', -Infinity) - numeric(a, 'amount', -Infinity),
+                turnover_desc: (a, b) => numeric(b, 'turnover', -Infinity) - numeric(a, 'turnover', -Infinity),
+                target_near: (a, b) => Math.abs(numeric(a, 'target_distance_pct', Infinity)) - Math.abs(numeric(b, 'target_distance_pct', Infinity)),
+                stop_near: (a, b) => numeric(a, 'stop_distance_pct', Infinity) - numeric(b, 'stop_distance_pct', Infinity),
+                name: (a, b) => String(a.name || '').localeCompare(String(b.name || ''), 'zh-CN'),
+            };
+            if (comparators[view.sort]) items.sort(comparators[view.sort]);
+
+            const toolbar = `<div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:9px">
+                <select id="watchGroupFilter" onchange="updateWatchlistView()" style="padding:5px 7px;border:1px solid var(--border);border-radius:5px;font-size:11px;background:white">
+                    ${option('all', '全部分组', view.group)}${groupsAvailable.map(group => option(group, group, view.group)).join('')}
+                </select>
+                <select id="watchStateFilter" onchange="updateWatchlistView()" style="padding:5px 7px;border:1px solid var(--border);border-radius:5px;font-size:11px;background:white">
+                    ${option('all', '全部状态', view.filter)}${option('alerts', '只看预警', view.filter)}${option('held', '只看持仓', view.filter)}${option('watch', '只看观察', view.filter)}${option('up', '只看上涨', view.filter)}${option('down', '只看下跌', view.filter)}${option('unavailable', '行情不可用', view.filter)}
+                </select>
+                <select id="watchSort" onchange="updateWatchlistView()" style="padding:5px 7px;border:1px solid var(--border);border-radius:5px;font-size:11px;background:white">
+                    ${option('manual', '默认顺序', view.sort)}${option('change_desc', '涨幅从高到低', view.sort)}${option('change_asc', '跌幅从低到高', view.sort)}${option('amount_desc', '成交额从高到低', view.sort)}${option('turnover_desc', '换手率从高到低', view.sort)}${option('target_near', '最接近目标价', view.sort)}${option('stop_near', '最接近止损价', view.sort)}${option('name', '名称排序', view.sort)}
+                </select>
+                <span style="margin-left:auto;font-size:10px;color:${meta.stale ? '#b06000' : 'var(--text-secondary)'}">${meta.stale ? '刷新失败，显示上次结果' : `显示 ${items.length} / ${allItems.length}`}</span>
+            </div>`;
+
+            const editableCount = allItems.filter(item => item.is_watchlisted).length;
+            const manager = editableCount ? `<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;padding:8px 10px;background:#f8fbff;border:1px solid var(--border);border-radius:7px;margin-bottom:8px">
+                <span style="font-size:11px;color:var(--text-secondary)">集中管理分组、关注理由、目标价和预警条件</span>
+                <button class="quick-btn" onclick="toggleWatchBulkEditor()" style="font-size:11px;white-space:nowrap">统一管理</button>
+            </div><div id="watchBulkEditor" style="display:none"></div>` : '';
+
+            if (!items.length) {
+                el.innerHTML = toolbar + manager + `<div style="font-size:12px;color:var(--text-secondary);padding:16px;text-align:center">当前筛选条件下没有标的</div>`;
+                return;
+            }
+
+            const grouped = {};
+            items.forEach(item => (grouped[displayGroup(item)] ||= []).push(item));
+            const cards = Object.entries(grouped).map(([group, stocks]) => `
+                <div style="margin-top:8px"><div style="font-size:11px;font-weight:700;color:var(--text-secondary);margin-bottom:2px">${escHtml(group)} · ${stocks.length}</div>
+                ${stocks.map(stock => {
+                    const code = safeSecurityCode(stock.code);
+                    const market = safeMarket(stock.market);
+                    const alerts = (stock.alerts || []).map(alert => `<span style="padding:1px 5px;border-radius:9px;background:#fef0ed;color:var(--danger);font-size:10px">${escHtml(alert.label)}</span>`).join(' ');
+                    const reason = stock.reason ? `<span>${escHtml(stock.reason)}</span>` : '';
+                    const quote = stock.quote_available
+                        ? `<span>${fmtNum(stock.price, 3)} · ${pnlHtml(stock.change_pct, '%')}</span>`
+                        : `<span style="color:#b06000">行情暂不可用</span>`;
+                    const metrics = stock.quote_available
+                        ? `<div style="font-size:10px;color:var(--text-secondary);margin-top:4px">高/低 ${fmtNum(stock.high,3)} / ${fmtNum(stock.low,3)} · 振幅 ${fmtNum(stock.amplitude_pct)}% · 成交 ${formatWatchAmount(stock.amount)} · 换手 ${fmtNum(stock.turnover)}%</div>`
+                        : `<div style="font-size:10px;color:#b06000;margin-top:4px">未使用0或0%代替缺失行情，请稍后刷新</div>`;
+                    const distanceParts = [];
+                    if (stock.target_price != null) {
+                        distanceParts.push(!stock.quote_available
+                            ? `<span>目标 ${fmtNum(stock.target_price,3)}（待行情恢复）</span>`
+                            : stock.target_distance_pct <= 0
+                                ? `<span style="color:var(--danger);font-weight:600">目标已达 ${fmtNum(stock.target_price,3)}</span>`
+                                : `<span>距目标 ${fmtNum(stock.target_distance_pct)}%（${fmtNum(stock.target_price,3)}）</span>`);
+                    }
+                    if (stock.stop_loss != null) {
+                        distanceParts.push(!stock.quote_available
+                            ? `<span>止损 ${fmtNum(stock.stop_loss,3)}（待行情恢复）</span>`
+                            : stock.stop_distance_pct <= 0
+                                ? `<span style="color:var(--danger);font-weight:600">止损已触发 ${fmtNum(stock.stop_loss,3)}</span>`
+                                : `<span>止损缓冲 ${fmtNum(stock.stop_distance_pct)}%（${fmtNum(stock.stop_loss,3)}）</span>`);
+                    }
+                    const reminder = [stock.alert_up_pct ? `涨${stock.alert_up_pct}%提醒` : '', stock.alert_down_pct ? `跌${stock.alert_down_pct}%提醒` : ''].filter(Boolean).map(escHtml).join(' · ');
+                    return `<div class="watch-card" style="${(stock.alerts || []).length ? 'border-left:3px solid #f9ab00;padding-left:9px' : ''}">
+                        <div style="display:flex;justify-content:space-between;gap:8px;align-items:center">
+                            <span class="link-name" onclick="openStockDetail('${code}','${market}')" style="font-size:13px;font-weight:${stock.is_portfolio ? '700' : '500'}">${escHtml(stock.name)} (${code}) <span style="font-size:9px;color:var(--text-secondary);text-transform:uppercase">${market}</span></span>
+                            <span style="font-size:12px;display:flex;align-items:center;gap:6px">${quote}${stock.is_watchlisted ? `<button onclick="event.stopPropagation();removeWatch('${code}','${market}',${stock.is_portfolio ? 'true' : 'false'})" style="padding:1px 6px;border:1px solid var(--border);border-radius:3px;background:white;cursor:pointer;font-size:10px;color:var(--text-secondary)">删除</button>` : ''}</span>
+                        </div>
+                        ${metrics}
+                        ${distanceParts.length || reason || reminder || alerts ? `<div class="watch-meta" style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">${distanceParts.join(' · ')}${reason ? ` · ${reason}` : ''}${reminder ? ` · <span>${reminder}</span>` : ''}${alerts ? ` ${alerts}` : ''}</div>` : ''}
+                    </div>`;
+                }).join('')}</div>`).join('');
+            el.innerHTML = toolbar + manager + cards;
+        };
+
+        window.loadWatchlist = async function() {
+            const el = document.getElementById("watchlistStocks");
+            try {
+                const resp = await fetch("/api/watchlist", {cache: "no-store"});
+                const data = await resp.json();
+                if (!resp.ok || data.error) throw new Error(data.error || `HTTP ${resp.status}`);
+                window._watchlistItems = Array.isArray(data.stocks) ? data.stocks : [];
+                const updated = data.updated_at ? new Date(data.updated_at) : null;
+                window._watchlistMeta = {
+                    summary: data.summary || {},
+                    source: data.source || '腾讯行情',
+                    updatedText: updated && !Number.isNaN(updated.getTime()) ? updated.toLocaleTimeString('zh-CN', {hour12:false}) : '--',
+                    stale: false,
+                };
+                renderWatchlist();
+            } catch (error) {
+                if ((window._watchlistItems || []).length) {
+                    window._watchlistMeta = {...(window._watchlistMeta || {}), stale: true};
+                    renderWatchlist();
+                } else {
+                    el.innerHTML = `<div style="color:var(--danger);font-size:12px">加载失败：${escHtml(error.message)}</div>`;
+                }
+            }
+        };
+
+        window.toggleWatchBulkEditor = function() {
+            const panel = document.getElementById('watchBulkEditor');
+            if (!panel) return;
+            if (panel.style.display !== 'none') { panel.style.display = 'none'; return; }
+            const items = (window._watchlistItems || []).filter(item => item.is_watchlisted);
+            panel.innerHTML = `<div style="border:1px solid var(--border);border-radius:8px;padding:10px;margin-bottom:10px">
+                ${items.map(s => {
+                    const code = safeSecurityCode(s.code);
+                    const market = safeMarket(s.market);
+                    return `<div data-watch-code="${code}" data-watch-market="${market}" style="padding:9px 0;border-bottom:1px solid #f1f3f4">
+                    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px"><b style="font-size:12px">${escHtml(s.name)} (${code})</b><label style="font-size:10px;color:var(--danger)"><input type="checkbox" data-field="remove"> 移除自选</label></div>
+                    <div class="watch-bulk-grid">
+                        <input data-field="group" value="${escHtml(s.group || '默认')}" placeholder="分组" style="padding:5px;border:1px solid var(--border);border-radius:4px;font-size:11px">
+                        <input data-field="reason" value="${escHtml(s.reason || '')}" placeholder="关注理由" style="padding:5px;border:1px solid var(--border);border-radius:4px;font-size:11px">
+                        <input data-field="target_price" type="number" step="0.001" value="${escHtml(s.target_price ?? '')}" placeholder="目标价" style="padding:5px;border:1px solid var(--border);border-radius:4px;font-size:11px">
+                        <input data-field="stop_loss" type="number" step="0.001" value="${escHtml(s.stop_loss ?? '')}" placeholder="止损价" style="padding:5px;border:1px solid var(--border);border-radius:4px;font-size:11px">
+                        <input data-field="alert_up_pct" type="number" step="0.1" value="${escHtml(s.alert_up_pct ?? '')}" placeholder="涨幅%" style="padding:5px;border:1px solid var(--border);border-radius:4px;font-size:11px">
+                        <input data-field="alert_down_pct" type="number" step="0.1" value="${escHtml(s.alert_down_pct ?? '')}" placeholder="跌幅%" style="padding:5px;border:1px solid var(--border);border-radius:4px;font-size:11px">
+                    </div>
+                </div>`;
+                }).join('')}
+                <div style="display:flex;justify-content:flex-end;gap:6px;margin-top:9px"><button class="quick-btn" onclick="toggleWatchBulkEditor()">取消</button><button onclick="saveWatchBulk()" style="padding:5px 12px;background:var(--primary);color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:11px">保存全部</button></div>
+            </div>`;
+            panel.style.display = 'block';
+        };
+
+        window.saveWatchBulk = async function() {
+            const rows = [...document.querySelectorAll('#watchBulkEditor [data-watch-code]')];
+            const button = document.querySelector('#watchBulkEditor button[onclick="saveWatchBulk()"]');
+            const items = rows.map(row => {
+                const get = name => row.querySelector(`[data-field="${name}"]`);
+                return {
+                    code: row.dataset.watchCode,
+                    market: row.dataset.watchMarket || '',
+                    remove: get('remove').checked,
+                    group: get('group').value.trim(),
+                    reason: get('reason').value.trim(),
+                    target_price: get('target_price').value,
+                    stop_loss: get('stop_loss').value,
+                    alert_up_pct: get('alert_up_pct').value,
+                    alert_down_pct: get('alert_down_pct').value,
+                };
+            });
+            const removeCount = items.filter(item => item.remove).length;
+            if (removeCount && !confirm(`将移除 ${removeCount} 项自选，并保存其余设置。是否继续？`)) return;
+            try {
+                if (button) { button.disabled = true; button.textContent = '保存中...'; }
+                const resp = await fetch('/api/watchlist/batch', {
+                    method: 'POST',
+                    headers: {'Content-Type':'application/json'},
+                    body: JSON.stringify({items}),
+                });
+                const data = await resp.json();
+                if (!resp.ok) throw new Error(data.error || '批量保存失败');
+                showToast(`已保存 ${data.updated || items.length} 项自选设置`);
+                await refreshWatchlistDependents();
+                loadAlerts();
+            } catch (e) {
+                showToast(e.message || '保存失败');
+            } finally {
+                if (button && button.isConnected) { button.disabled = false; button.textContent = '保存全部'; }
+            }
+        };
+
+        let _watchSearchTimer = null;
+        let _watchSearchSeq = 0;
+        let _watchSearchController = null;
+
+        window.scheduleWatchSearch = function() {
+            clearTimeout(_watchSearchTimer);
+            const query = document.getElementById('watchCode')?.value.trim() || '';
+            const panel = document.getElementById('watchSuggestions');
+            if (!query || /^\d{5,6}$/.test(query)) {
+                if (panel) panel.style.display = 'none';
+                return;
+            }
+            _watchSearchTimer = setTimeout(() => showWatchSuggestions(query, false), 280);
+        };
+
+        window.showWatchSuggestions = async function(query, notifyEmpty=true) {
+            const panel = document.getElementById('watchSuggestions');
+            if (!panel) return;
+            const seq = ++_watchSearchSeq;
+            if (_watchSearchController) _watchSearchController.abort();
+            _watchSearchController = new AbortController();
+            panel.style.display = 'block';
+            panel.innerHTML = '<div style="font-size:11px;color:var(--text-secondary);padding:6px">正在搜索...</div>';
+            try {
+                const resp = await fetch(`/api/stock/search?q=${encodeURIComponent(query)}`, {
+                    signal: _watchSearchController.signal,
+                });
+                const data = await resp.json();
+                if (seq !== _watchSearchSeq) return;
+                if (!resp.ok || data.error) throw new Error(data.error || '搜索失败');
+                const results = data.results || [];
+                if (!results.length) {
+                    panel.innerHTML = '<div style="font-size:11px;color:var(--text-secondary);padding:6px">没有匹配的证券</div>';
+                    if (notifyEmpty) showToast('没有找到匹配的证券');
+                    return;
+                }
+                panel.innerHTML = results.map(s => `<button type="button" onclick="addWatchByCode('${s.code}','${s.market}')" style="display:flex;width:100%;justify-content:space-between;padding:7px 8px;border:none;border-bottom:1px solid #f1f3f4;background:white;cursor:pointer;font-size:11px;text-align:left"><span>${escHtml(s.name)} (${s.code})</span><span style="color:var(--text-secondary)">${escHtml(s.market)} · ${escHtml(s.type)}</span></button>`).join('');
+            } catch (e) {
+                if (e.name !== 'AbortError' && seq === _watchSearchSeq) {
+                    panel.innerHTML = `<div style="font-size:11px;color:var(--danger);padding:6px">${escHtml(e.message)}</div>`;
+                }
+            }
+        };
+
+        window.addWatchByCode = async function(code, market='') {
+            const value = id => document.getElementById(id)?.value.trim() || '';
+            const payload = {code, market, group:value('watchGroup'), target_price:value('watchTarget'), stop_loss:value('watchStop'), alert_up_pct:value('watchUp'), alert_down_pct:value('watchDown')};
+            const resp = await fetch('/api/watchlist/add', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)});
+            const data = await resp.json();
+            if (!resp.ok || !data.success) { showToast(data.error || '添加失败'); return; }
+            showToast(`已添加：${data.name}`);
+            ['watchCode','watchTarget','watchStop','watchUp','watchDown'].forEach(id => { const x=document.getElementById(id); if(x)x.value=''; });
+            const panel = document.getElementById('watchSuggestions');
+            if (panel) panel.style.display = 'none';
+            await refreshWatchlistDependents();
+            loadAlerts();
+        };
+
+        window.addWatch = async function() {
+            const query = document.getElementById('watchCode')?.value.trim() || '';
+            if (!query) { showToast('请输入代码或部分股名'); return; }
+            if (/^\d{5,6}$/.test(query)) {
+                await addWatchByCode(query);
+            } else {
+                await showWatchSuggestions(query, true);
+                showToast('请选择匹配的证券');
+            }
+        };
+
+        async function loadPortfolioHealth() {
+            const el = document.getElementById('portfolioHealth');
+            if (!el) return;
+            try {
+                const data = await (await fetch('/api/portfolio/health')).json();
+                if (data.error) throw new Error(data.error);
+                const scoreColor = data.score >= 80 ? 'var(--success)' : (data.score >= 60 ? '#f9ab00' : 'var(--danger)');
+                const dims = data.dimensions || {};
+                el.innerHTML = `<div style="display:flex;align-items:center;gap:14px;margin-bottom:10px"><div style="font-size:30px;font-weight:800;color:${scoreColor}">${data.score}</div><div><b>${escHtml(data.level)}</b><div style="font-size:10px;color:var(--text-secondary)">综合健康分 · ${escHtml((data.as_of || '').replace('T',' '))}</div></div></div>
+                    <div class="metric-grid">${[['趋势',dims.trend],['集中度',dims.concentration],['风险线',dims.risk_lines],['数据完整',dims.data_quality]].map(x => `<div class="metric-box"><div class="label">${x[0]}</div><div class="value">${fmtNum(x[1],0)}</div></div>`).join('')}</div>
+                    ${(data.positions || []).map(p => `<div style="padding:7px 0;border-top:1px solid #f1f3f4;font-size:11px"><span class="link-name" onclick="openStockDetail('${p.code}')"><b>${escHtml(p.name)}</b></span> · 仓位 ${fmtNum(p.weight)}% · ${pnlHtml(p.pnl_pct,'%')} · 健康 ${p.health_score}${p.flags.length ? `<div style="color:#b06000">${p.flags.map(escHtml).join('；')}</div>` : ''}</div>`).join('') || '<div style="font-size:12px;color:var(--text-secondary)">暂无持仓</div>'}`;
+            } catch(e) { el.innerHTML = `<div style="color:var(--danger)">${escHtml(e.message)}</div>`; }
+        }
+
+        async function loadAttribution() {
+            const el = document.getElementById('attributionList');
+            if (!el) return;
+            try {
+                const data = await (await fetch('/api/portfolio/attribution')).json();
+                if (data.error) throw new Error(data.error);
+                el.innerHTML = `<div class="metric-grid"><div class="metric-box"><div class="label">已实现</div><div class="value">${pnlHtml(data.realized,'元')}</div></div><div class="metric-box"><div class="label">未实现</div><div class="value">${pnlHtml(data.unrealized,'元')}</div></div><div class="metric-box"><div class="label">累计合计</div><div class="value">${pnlHtml(data.total_pnl,'元')}</div></div><div class="metric-box"><div class="label">历史快照</div><div class="value">${data.data_quality.snapshot_count}</div></div></div>
+                    ${(data.contributions || []).map(x => `<div style="padding:7px 0;border-top:1px solid #f1f3f4;font-size:11px"><div style="display:flex;justify-content:space-between"><span>${escHtml(x.name)} (${x.code})</span><span>${pnlHtml(x.pnl,'元')}</span></div><div class="progress-track" style="margin-top:4px"><div class="progress-fill" style="width:${Math.min(100,x.impact_pct)}%;background:${x.pnl>=0?'var(--danger)':'var(--success)'}"></div></div><div style="color:var(--text-secondary);margin-top:2px">影响占比 ${x.impact_pct}% · 已实现 ${fmtNum(x.realized)} · 未实现 ${fmtNum(x.unrealized)}</div></div>`).join('')}
+                    ${(data.data_quality.warnings || []).map(x => `<div style="font-size:10px;color:#b06000;margin-top:7px">⚠ ${escHtml(x)}</div>`).join('')}`;
+            } catch(e) { el.innerHTML = `<div style="color:var(--danger)">${escHtml(e.message)}</div>`; }
+        }
+
+        async function loadAlerts() {
+            const el = document.getElementById('unifiedAlerts'); if (!el) return;
+            try {
+                const data = await (await fetch('/api/alerts')).json();
+                if (data.error) throw new Error(data.error);
+                document.getElementById('alertCount').textContent = data.unread_count ? `未读 ${data.unread_count}` : '暂无未读';
+                el.innerHTML = (data.alerts || []).map(a => `<div class="alert-row alert-${a.level}"><div style="display:flex;justify-content:space-between;gap:8px"><b style="font-size:12px">${escHtml(a.title)}</b><span class="tag">${escHtml(a.source)}</span></div><div style="font-size:11px;margin-top:3px">${escHtml(a.message)}</div><div style="font-size:10px;color:var(--text-secondary);margin-top:3px">${escHtml(a.action || '')}</div><div style="margin-top:5px"><button class="quick-btn" onclick="actAlert('${a.id}','ack')" style="font-size:10px;padding:2px 7px">已读</button><button class="quick-btn" onclick="actAlert('${a.id}','dismiss')" style="font-size:10px;padding:2px 7px">忽略</button></div></div>`).join('') || '<div style="font-size:12px;color:var(--text-secondary)">当前没有触发中的预警</div>';
+            } catch(e) { el.innerHTML = `<div style="color:var(--danger)">${escHtml(e.message)}</div>`; }
+        }
+
+        window.actAlert = async function(id, action) {
+            if (action === 'dismiss' && !confirm('确认忽略这条预警？')) return;
+            const resp = await fetch('/api/alerts/action',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id,action})});
+            const data = await resp.json();
+            if (!resp.ok) { showToast(data.error || '操作失败'); return; }
+            loadAlerts();
+        };
+
+        async function loadEvents() {
+            const el = document.getElementById('eventList'); if (!el) return;
+            try {
+                const data = await (await fetch('/api/events')).json();
+                el.innerHTML = (data.events || []).map(e => `<div style="padding:8px 0;border-bottom:1px solid #f1f3f4"><div style="display:flex;justify-content:space-between"><b style="font-size:12px">${escHtml(e.title)}</b><span class="tag">${escHtml(e.type)}</span></div><div style="font-size:11px;color:var(--text-secondary);margin-top:3px">${escHtml(e.date)} ${escHtml(e.time || '')}${e.code ? ` · ${escHtml(e.code)}` : ''}<button onclick="deleteEvent('${e.id}')" style="float:right;border:none;background:none;color:var(--text-secondary);cursor:pointer">×</button></div>${e.note ? `<div style="font-size:11px;margin-top:3px">${escHtml(e.note)}</div>` : ''}</div>`).join('') || '<div style="font-size:12px;color:var(--text-secondary)">未来30天暂无自定义事件</div>';
+            } catch(e) { el.innerHTML = `<div style="color:var(--danger)">${escHtml(e.message)}</div>`; }
+        }
+
+        window.addEvent = async function() {
+            const payload = {date:document.getElementById('eventDate').value,title:document.getElementById('eventTitle').value.trim(),code:document.getElementById('eventCode').value.trim(),type:document.getElementById('eventType').value};
+            const resp = await fetch('/api/events/add',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}); const data=await resp.json();
+            if(!resp.ok){showToast(data.error||'添加失败');return;} showToast('事件已添加'); document.getElementById('eventTitle').value=''; loadEvents(); loadAlerts();
+        };
+        window.deleteEvent = async function(id) {
+            if (!confirm('确认删除这个事件？')) return;
+            const resp = await fetch('/api/events/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})});
+            const data = await resp.json();
+            if (!resp.ok) { showToast(data.error || '删除失败'); return; }
+            showToast('事件已删除');
+            loadEvents(); loadAlerts();
+        };
+        function loadInsights(){ return Promise.all([loadAlerts(),loadEvents()]); }
+
+        function enhanceDashboard() {
+            const search = document.getElementById('stockSearch');
+            search.placeholder = '输入5位港股或6位A股/ETF代码'; search.maxLength = 6;
+            const addRow = document.getElementById('watchCode')?.parentElement;
+            if (addRow) {
+                addRow.style.flexWrap='wrap';
+                addRow.innerHTML = `<input type="text" id="watchCode" placeholder="代码或部分股名" maxlength="30" oninput="scheduleWatchSearch()" onkeydown="if(event.key==='Enter')addWatch()" autocomplete="off" style="width:120px;padding:6px;border:1px solid var(--border);border-radius:4px;font-size:12px"><input id="watchGroup" placeholder="分组" value="默认" style="width:65px;padding:6px;border:1px solid var(--border);border-radius:4px;font-size:12px"><input type="number" id="watchTarget" placeholder="目标价" step="0.001" style="width:70px;padding:6px;border:1px solid var(--border);border-radius:4px;font-size:12px"><input type="number" id="watchStop" placeholder="止损价" step="0.001" style="width:70px;padding:6px;border:1px solid var(--border);border-radius:4px;font-size:12px"><input type="number" id="watchUp" placeholder="涨幅提醒%" step="0.1" style="width:82px;padding:6px;border:1px solid var(--border);border-radius:4px;font-size:12px"><input type="number" id="watchDown" placeholder="跌幅提醒%" step="0.1" style="width:82px;padding:6px;border:1px solid var(--border);border-radius:4px;font-size:12px"><button onclick="addWatch()" style="padding:6px 12px;background:var(--primary);color:white;border:none;border-radius:4px;cursor:pointer;font-size:12px">添加</button><div id="watchSuggestions" style="display:none;width:100%;max-height:220px;overflow-y:auto;border:1px solid var(--border);border-radius:6px;background:white;margin-top:2px;box-shadow:0 5px 14px rgba(0,0,0,.08);z-index:20"></div>`;
+            }
+            const tab1 = document.getElementById('tab-1');
+            if (tab1 && !document.getElementById('portfolioHealth')) {
+                tab1.insertAdjacentHTML('afterbegin', `<div class="insight-grid"><div class="card"><h3>持仓健康度</h3><div id="portfolioHealth"><div class="loading">加载中</div></div></div><div class="card"><h3>收益归因</h3><div id="attributionList"><div class="loading">加载中</div></div></div></div>`);
+            }
+            const bar = document.querySelector('.tab-bar');
+            if (bar && !document.getElementById('insightTabButton')) bar.insertAdjacentHTML('beforeend','<button id="insightTabButton" class="tab-btn" onclick="showTab(6)">洞察</button>');
+            const panel = document.querySelector('.data-panel');
+            if (panel && !document.getElementById('tab-6')) panel.insertAdjacentHTML('beforeend', `<div class="tab-content" id="tab-6"><div class="insight-grid"><div class="card"><h3>统一预警 <span id="alertCount" style="float:right;font-size:10px;color:var(--text-secondary);font-weight:400"></span></h3><div id="unifiedAlerts"><div class="loading">加载中</div></div></div><div class="card"><h3>投资事件日历</h3><div style="display:flex;gap:5px;flex-wrap:wrap;margin-bottom:8px"><input type="date" id="eventDate" style="padding:5px;border:1px solid var(--border);border-radius:4px;font-size:11px"><select id="eventType" style="padding:5px;border:1px solid var(--border);border-radius:4px;font-size:11px"><option value="earnings">财报</option><option value="dividend">分红</option><option value="meeting">会议</option><option value="macro">宏观</option><option value="other">其他</option></select><input id="eventCode" placeholder="相关代码" style="width:70px;padding:5px;border:1px solid var(--border);border-radius:4px;font-size:11px"><input id="eventTitle" placeholder="事件标题" style="flex:1;min-width:100px;padding:5px;border:1px solid var(--border);border-radius:4px;font-size:11px"><button onclick="addEvent()" style="padding:5px 9px;background:var(--primary);color:white;border:none;border-radius:4px;cursor:pointer;font-size:11px">添加</button></div><div id="eventList"><div class="loading">加载中</div></div></div></div></div>`);
+            const dateInput = document.getElementById('eventDate'); if(dateInput && !dateInput.value) dateInput.value = new Date().toISOString().slice(0,10);
+        }
+
+        document.addEventListener('DOMContentLoaded', () => {
+            enhanceDashboard();
+            scheduleVisibleRefresh(loadPortfolioHealth, 90 * 1000, [1]);
+            scheduleVisibleRefresh(loadAttribution, 90 * 1000, [1]);
+            scheduleVisibleRefresh(loadInsights, 5 * 60 * 1000, [6]);
+        });
+    </script>
+</body>
+</html>

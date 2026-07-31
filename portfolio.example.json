@@ -1,0 +1,12 @@
+[
+  {
+    "code": "600000",
+    "market": "sh",
+    "name": "示例股票",
+    "cost": 10.0,
+    "shares": 100,
+    "stop_loss": 9.0,
+    "take_profit": 13.0,
+    "first_buy_date": "2026-01-01"
+  }
+]
