@@ -1,33 +1,14 @@
 """
 Market data tools - using Tencent Finance API (reliable)
 """
-import re
-import requests
 from langchain_core.tools import tool
 
 from tools import quote as _q
 
 
 def _tencent_get(codes: list) -> dict:
-    """Fetch data from Tencent Finance API"""
-    s = requests.Session()
-    s.trust_env = False
-    code_str = ",".join(codes)
-    resp = s.get(f"https://qt.gtimg.cn/q={code_str}", timeout=10)
-    resp.encoding = "gbk"
-
-    results = {}
-    for line in resp.text.strip().split(";"):
-        line = line.strip()
-        if not line:
-            continue
-        match = re.match(r'v_(\w+)="(.+)"', line)
-        if match:
-            code = match.group(1)
-            fields = match.group(2).split("~")
-            if len(fields) > 40:
-                results[code] = fields
-    return results
+    """通过共享 TTL/LRU 行情层批量获取数据。"""
+    return _q.get_quotes(codes)
 
 
 def _code_prefix(symbol: str) -> str:
@@ -69,18 +50,8 @@ def get_stock_history(symbol: str, days: int = 30) -> str:
     - days: 获取最近多少天的数据，默认30天
     """
     try:
-        s = requests.Session()
-        s.trust_env = False
         code = _code_prefix(symbol)
-
-        resp = s.get(
-            f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={code},day,,,{days},qfq",
-            timeout=10
-        )
-        data = resp.json()
-        klines = data.get("data", {}).get(code, {}).get("day", [])
-        if not klines:
-            klines = data.get("data", {}).get(code, {}).get("qfqday", [])
+        klines = _q.get_klines_raw(code, days)
 
         if not klines:
             return f"未获取到 {symbol} 的历史数据"
@@ -105,18 +76,8 @@ def get_stock_history(symbol: str, days: int = 30) -> str:
 def get_stock_technical_indicators(symbol: str) -> str:
     """计算股票/ETF的技术指标（MA均线、MACD、RSI）。输入股票代码。"""
     try:
-        s = requests.Session()
-        s.trust_env = False
         code = _code_prefix(symbol)
-
-        resp = s.get(
-            f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={code},day,,,60,qfq",
-            timeout=10
-        )
-        data = resp.json()
-        klines = data.get("data", {}).get(code, {}).get("day", [])
-        if not klines:
-            klines = data.get("data", {}).get(code, {}).get("qfqday", [])
+        klines = _q.get_klines_raw(code, 60)
 
         if not klines or len(klines) < 20:
             return f"数据不足，无法计算技术指标"

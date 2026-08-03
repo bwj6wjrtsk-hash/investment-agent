@@ -6,20 +6,27 @@
 import re
 import time
 import threading
+from collections import OrderedDict
+
 import requests
 
-_QUOTE_CACHE = {}   # prefix_code -> (ts, fields)
-_KLINE_CACHE = {}   # prefix_code -> (ts, fetched_days, closes)
+# 行情/K线缓存均有硬容量上限；固定分片锁避免按用户输入永久创建 Lock。
+_QUOTE_CACHE = OrderedDict()   # prefix_code -> (ts, fields)
+_KLINE_CACHE = OrderedDict()   # prefix_code -> (ts, fetched_days, closes)
 _BREADTH_CACHE = {"ts": 0, "ttl": 0, "data": None}
 _LOCK = threading.Lock()
-_QUOTE_FETCH_LOCKS = {}  # prefix_code -> Lock；相同证券单飞，不同证券可并行
-_KLINE_FETCH_LOCKS = {}  # prefix_code -> Lock；不同天数请求共享较长窗口
+_FETCH_LOCK_STRIPES = 64
+_QUOTE_FETCH_LOCKS = [threading.Lock() for _ in range(_FETCH_LOCK_STRIPES)]
+_KLINE_FETCH_LOCKS = [threading.Lock() for _ in range(_FETCH_LOCK_STRIPES)]
 _BREADTH_FETCH_LOCK = threading.Lock()
 
 QUOTE_TTL = 15      # 实时行情缓存秒数
 KLINE_TTL = 300     # K线缓存秒数
 BREADTH_TTL = 60    # 涨跌家数缓存秒数
 BREADTH_FAILURE_TTL = 15  # 上游异常短暂负缓存，避免连续请求阻塞首页
+QUOTE_CACHE_MAXSIZE = 2048
+KLINE_CACHE_MAXSIZE = 512
+_SYMBOL_RE = re.compile(r"^(?:(?:sh|sz|bj)\d{6}|hk\d{5}|\d{5,6})$", re.IGNORECASE)
 
 # 腾讯行情字段索引（~ 分隔）常量，避免魔法数字
 F_NAME = 1
@@ -44,12 +51,17 @@ def _session():
     return s
 
 
+def is_valid_symbol(symbol: str) -> bool:
+    """只接受 A/港股数字代码及明确的交易所前缀，阻止任意缓存键。"""
+    return bool(_SYMBOL_RE.fullmatch((symbol or "").strip()))
+
+
 def code_prefix(symbol: str) -> str:
     """给股票/基金代码加正确的交易所前缀（支持沪/深/北交所及港交所）。"""
-    s = (symbol or "").strip()
+    s = (symbol or "").strip().lower()
     if not s:
         return s
-    market = s[:2].lower()
+    market = s[:2]
     if market in ("sh", "sz", "bj", "hk"):
         return market + s[2:]
     # 港股使用 5 位数字代码；A 股、ETF 和北交所代码均为 6 位。
@@ -66,8 +78,32 @@ def code_prefix(symbol: str) -> str:
         return "sz" + s
     if c in ("4", "8"):                # 北交所
         return "bj" + s
-    # 兜底
-    return "sz" + s
+    return ""
+
+
+def _cache_get(cache, key, ttl, now=None):
+    """调用方持有 _LOCK；命中时刷新 LRU，过期时立即删除。"""
+    cached = cache.get(key)
+    if not cached:
+        return None
+    if (now or time.time()) - cached[0] > ttl:
+        cache.pop(key, None)
+        return None
+    cache.move_to_end(key)
+    return cached
+
+
+def _cache_put(cache, key, value, maxsize):
+    """调用方持有 _LOCK；写入并按 LRU 淘汰至硬容量上限。"""
+    cache[key] = value
+    cache.move_to_end(key)
+    while len(cache) > maxsize:
+        cache.popitem(last=False)
+
+
+def _striped_locks(symbols, stripes):
+    indexes = sorted({hash(symbol) % len(stripes) for symbol in symbols})
+    return [stripes[index] for index in indexes]
 
 
 def _safe_float(v, default=0.0):
@@ -78,25 +114,23 @@ def _safe_float(v, default=0.0):
 
 
 def get_quotes(codes, ttl=QUOTE_TTL) -> dict:
-    """批量获取实时行情原始字段。codes 为不带前缀的代码列表。
-    返回 {带前缀code: fields列表}。带 TTL 缓存。"""
-    prefixed = [code_prefix(c) for c in codes]
+    """批量获取实时行情原始字段；忽略非法代码并使用有界 TTL/LRU 缓存。"""
+    prefixed = [code_prefix(c) for c in codes if is_valid_symbol(c)]
+    prefixed = [code for code in prefixed if code]
     now = time.time()
     result = {}
     missing = []
     with _LOCK:
         for p in prefixed:
-            cached = _QUOTE_CACHE.get(p)
-            if cached and now - cached[0] <= ttl:
+            cached = _cache_get(_QUOTE_CACHE, p, ttl, now)
+            if cached:
                 result[p] = cached[1]
             else:
                 missing.append(p)
 
     if missing:
-        # 相同证券的并发请求合并；不同证券集合各自访问上游，不互相排队。
         symbols = sorted(set(missing))
-        with _LOCK:
-            fetch_locks = [_QUOTE_FETCH_LOCKS.setdefault(p, threading.Lock()) for p in symbols]
+        fetch_locks = _striped_locks(symbols, _QUOTE_FETCH_LOCKS)
         for lock in fetch_locks:
             lock.acquire()
         try:
@@ -104,28 +138,32 @@ def get_quotes(codes, ttl=QUOTE_TTL) -> dict:
             now = time.time()
             with _LOCK:
                 for p in symbols:
-                    cached = _QUOTE_CACHE.get(p)
-                    if cached and now - cached[0] <= ttl:
+                    cached = _cache_get(_QUOTE_CACHE, p, ttl, now)
+                    if cached:
                         result[p] = cached[1]
                     else:
                         pending.append(p)
             if pending:
                 try:
-                    s = _session()
-                    resp = s.get(f"https://qt.gtimg.cn/q={','.join(pending)}", timeout=10)
-                    resp.encoding = "gbk"
+                    with _session() as session:
+                        resp = session.get(f"https://qt.gtimg.cn/q={','.join(pending)}", timeout=10)
+                        resp.encoding = "gbk"
+                        text = resp.text
                     fetched_at = time.time()
                     with _LOCK:
-                        for line in resp.text.strip().split(";"):
+                        for line in text.strip().split(";"):
                             line = line.strip()
                             if not line:
                                 continue
-                            m = re.match(r'v_(\w+)="(.+)"', line)
-                            if m:
-                                code = m.group(1)
-                                fields = m.group(2).split("~")
-                                if len(fields) > F_CHANGE_PCT:
-                                    _QUOTE_CACHE[code] = (fetched_at, fields)
+                            match = re.match(r'v_(\w+)="(.+)"', line)
+                            if match:
+                                code = match.group(1)
+                                fields = match.group(2).split("~")
+                                if code in pending and len(fields) > F_CHANGE_PCT:
+                                    _cache_put(
+                                        _QUOTE_CACHE, code, (fetched_at, fields),
+                                        QUOTE_CACHE_MAXSIZE,
+                                    )
                                     result[code] = fields
                 except Exception:
                     pass  # 网络失败时返回已命中缓存的部分
@@ -145,16 +183,16 @@ def get_price(symbol: str):
 
 
 def get_closes(symbol: str, days: int = 120, ttl=KLINE_TTL):
-    """获取前复权日K收盘价；较长窗口可复用给较短窗口，并按标的合并并发请求。"""
+    """获取前复权日K收盘价；较长窗口可复用给较短窗口。"""
+    if not is_valid_symbol(symbol):
+        return None
     p = code_prefix(symbol)
-    requested_days = max(1, int(days))
-    # 常用的60/120日指标统一拉120日，避免同一标的重复访问上游。
+    requested_days = max(1, min(int(days), 1000))
     fetch_days = max(120, requested_days)
 
     def cached_result(now):
-        cached = _KLINE_CACHE.get(p)
-        if (cached and now - cached[0] <= ttl and
-                cached[1] >= requested_days):
+        cached = _cache_get(_KLINE_CACHE, p, ttl, now)
+        if cached and cached[1] >= requested_days:
             return cached[2][-requested_days:]
         return None
 
@@ -162,17 +200,16 @@ def get_closes(symbol: str, days: int = 120, ttl=KLINE_TTL):
         cached = cached_result(time.time())
         if cached is not None:
             return cached
-        fetch_lock = _KLINE_FETCH_LOCKS.setdefault(p, threading.Lock())
+    fetch_lock = _KLINE_FETCH_LOCKS[hash(p) % len(_KLINE_FETCH_LOCKS)]
 
     with fetch_lock:
-        # 其他线程可能刚完成同一标的的较长窗口请求，获取锁后再次检查。
         with _LOCK:
             cached = cached_result(time.time())
             if cached is not None:
                 return cached
         try:
-            with _session() as s:
-                resp = s.get(
+            with _session() as session:
+                resp = session.get(
                     f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={p},day,,,{fetch_days},qfq",
                     timeout=10,
                 )
@@ -182,7 +219,10 @@ def get_closes(symbol: str, days: int = 120, ttl=KLINE_TTL):
             closes = [_safe_float(k[2]) for k in klines if len(k) > 2]
             if closes:
                 with _LOCK:
-                    _KLINE_CACHE[p] = (time.time(), fetch_days, closes)
+                    _cache_put(
+                        _KLINE_CACHE, p, (time.time(), fetch_days, closes),
+                        KLINE_CACHE_MAXSIZE,
+                    )
                 return closes[-requested_days:]
         except Exception:
             pass
@@ -191,14 +231,17 @@ def get_closes(symbol: str, days: int = 120, ttl=KLINE_TTL):
 
 def get_klines_raw(symbol: str, days: int = 120):
     """获取原始日K数组（含开高低收量），取不到返回 []。"""
+    if not is_valid_symbol(symbol):
+        return []
     p = code_prefix(symbol)
+    days = max(1, min(int(days), 1000))
     try:
-        s = _session()
-        resp = s.get(
-            f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={p},day,,,{days},qfq",
-            timeout=10,
-        )
-        data = resp.json()
+        with _session() as session:
+            resp = session.get(
+                f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={p},day,,,{days},qfq",
+                timeout=10,
+            )
+            data = resp.json()
         node = data.get("data", {}).get(p, {})
         return node.get("day") or node.get("qfqday") or []
     except Exception:

@@ -132,9 +132,6 @@ def _online_detect_sector(code: str) -> str:
     import requests
     import json
 
-    s = requests.Session()
-    s.trust_env = False
-
     from tools import quote as _q
     prefix = _q.code_prefix(code)
 
@@ -154,11 +151,13 @@ def _online_detect_sector(code: str) -> str:
 
     for node, sector_name in node_to_sector.items():
         try:
-            r = s.get(
-                "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData",
-                params={"page": "1", "num": "80", "sort": "symbol", "asc": "1", "node": node},
-                timeout=2
-            )
+            with requests.Session() as session:
+                session.trust_env = False
+                r = session.get(
+                    "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData",
+                    params={"page": "1", "num": "80", "sort": "symbol", "asc": "1", "node": node},
+                    timeout=2
+                )
             if r.status_code == 200 and r.text.strip() != "[]":
                 items = json.loads(r.text)
                 codes = [i["symbol"] for i in items]
@@ -214,13 +213,13 @@ def _fetch_sector_stocks(sector_name: str) -> list:
         return []
 
     try:
-        s = requests.Session()
-        s.trust_env = False
-        r = s.get(
-            "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData",
-            params={"page": "1", "num": "8", "sort": "nmc", "asc": "0", "node": node},
-            timeout=5
-        )
+        with requests.Session() as session:
+            session.trust_env = False
+            r = session.get(
+                "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData",
+                params={"page": "1", "num": "8", "sort": "nmc", "asc": "0", "node": node},
+                timeout=5
+            )
         if r.status_code == 200 and r.text.strip() != "[]":
             items = json.loads(r.text)
             # Convert to Tencent format codes

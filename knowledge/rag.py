@@ -2,22 +2,30 @@
 RAG 知识库 - 存储和检索你的投资笔记、研报等
 """
 import os
+import threading
+
 import chromadb
-from chromadb.config import Settings
 
 
 # 知识库存储路径
 DB_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "chromadb")
+_CLIENT = None
+_COLLECTION = None
+_COLLECTION_LOCK = threading.Lock()
 
 
 def get_collection():
-    """获取或创建知识库集合"""
-    client = chromadb.PersistentClient(path=DB_PATH)
-    collection = client.get_or_create_collection(
-        name="investment_knowledge",
-        metadata={"description": "个人投资知识库"}
-    )
-    return collection
+    """线程安全地复用持久化客户端和集合，避免每次调用重复初始化。"""
+    global _CLIENT, _COLLECTION
+    if _COLLECTION is None:
+        with _COLLECTION_LOCK:
+            if _COLLECTION is None:
+                _CLIENT = chromadb.PersistentClient(path=DB_PATH)
+                _COLLECTION = _CLIENT.get_or_create_collection(
+                    name="investment_knowledge",
+                    metadata={"description": "个人投资知识库"},
+                )
+    return _COLLECTION
 
 
 def add_document(content: str, metadata: dict = None, doc_id: str = None):
@@ -55,12 +63,13 @@ def search_knowledge(query: str, top_k: int = 5) -> list:
     - 相关文档列表
     """
     collection = get_collection()
-    if collection.count() == 0:
+    document_count = collection.count()
+    if document_count == 0:
         return []
 
     results = collection.query(
         query_texts=[query],
-        n_results=min(top_k, collection.count())
+        n_results=min(top_k, document_count)
     )
     
     documents = []

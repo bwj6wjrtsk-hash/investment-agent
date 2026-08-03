@@ -71,12 +71,12 @@ def _load_portfolio():
 
 def _get_prices(codes: list) -> dict:
     """Batch get current prices"""
-    s = requests.Session()
-    s.trust_env = False
     prefixed = [_q.code_prefix(code) for code in codes]
 
-    resp = s.get(f"https://qt.gtimg.cn/q={','.join(prefixed)}", timeout=10)
-    resp.encoding = "gbk"
+    with requests.Session() as session:
+        session.trust_env = False
+        resp = session.get(f"https://qt.gtimg.cn/q={','.join(prefixed)}", timeout=10)
+        resp.encoding = "gbk"
 
     prices = {}
     for line in resp.text.strip().split(";"):

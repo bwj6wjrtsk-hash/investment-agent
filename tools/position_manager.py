@@ -24,11 +24,11 @@ def _load_portfolio():
 
 def _get_current_price(code: str) -> float:
     """Get current price for a stock/ETF"""
-    s = requests.Session()
-    s.trust_env = False
     prefix = _quote.code_prefix(code)
-    resp = s.get(f"https://qt.gtimg.cn/q={prefix}", timeout=10)
-    resp.encoding = "gbk"
+    with requests.Session() as session:
+        session.trust_env = False
+        resp = session.get(f"https://qt.gtimg.cn/q={prefix}", timeout=10)
+        resp.encoding = "gbk"
     match = re.match(r'v_\w+="(.+)"', resp.text.strip().split(";")[0].strip())
     if match:
         fields = match.group(1).split("~")
@@ -155,16 +155,16 @@ def simulate_dca(symbol: str, monthly_amount: float = 2000.0, months: int = 12) 
     - months: 定投月数（默认12个月）
     """
     try:
-        s = requests.Session()
-        s.trust_env = False
         prefix = _quote.code_prefix(symbol)
 
         # 获取足够的历史数据
         days_needed = months * 22  # 每月约22个交易日
-        resp = s.get(
-            f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={prefix},day,,,{days_needed},qfq",
-            timeout=10
-        )
+        with requests.Session() as session:
+            session.trust_env = False
+            resp = session.get(
+                f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={prefix},day,,,{days_needed},qfq",
+                timeout=10
+            )
         data = resp.json()
         klines = data.get("data", {}).get(prefix, {}).get("day", [])
         if not klines:

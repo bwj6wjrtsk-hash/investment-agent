@@ -13,13 +13,13 @@ from tools import quote as _q
 
 def _fetch_klines(symbol: str, days: int = 250) -> list:
     """Fetch historical kline data"""
-    s = requests.Session()
-    s.trust_env = False
     prefix = _q.code_prefix(symbol)
-    resp = s.get(
-        f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={prefix},day,,,{days},qfq",
-        timeout=10
-    )
+    with requests.Session() as session:
+        session.trust_env = False
+        resp = session.get(
+            f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={prefix},day,,,{days},qfq",
+            timeout=10
+        )
     data = resp.json()
     klines = data.get("data", {}).get(prefix, {}).get("day", [])
     if not klines:

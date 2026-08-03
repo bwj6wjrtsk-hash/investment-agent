@@ -154,10 +154,11 @@ def create_investment_agent():
 import threading
 _conversation_history = []
 _history_lock = threading.Lock()
+_chat_lock = threading.Lock()  # 单用户会话串行化，保证上下文顺序并避免并发重型调用
 MAX_HISTORY = 6  # Keep last 6 messages (3 rounds of Q&A)
 
 
-def chat(agent, user_input: str) -> str:
+def _chat_unlocked(agent, user_input: str) -> str:
     """与 Agent 对话（带上下文记忆 + 实时时间）"""
     from langchain_core.messages import AIMessage, SystemMessage
     from datetime import datetime
@@ -196,3 +197,9 @@ def chat(agent, user_input: str) -> str:
             _conversation_history.pop(0)
 
     return response_content
+
+
+def chat(agent, user_input: str) -> str:
+    """串行执行单用户对话，避免历史快照交错和重复占用模型资源。"""
+    with _chat_lock:
+        return _chat_unlocked(agent, user_input)

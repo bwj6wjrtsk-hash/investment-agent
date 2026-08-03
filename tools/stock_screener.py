@@ -15,11 +15,11 @@ from tools import quote as _q
 
 def _tencent_get_batch(codes: list) -> dict:
     """Batch fetch from Tencent"""
-    s = requests.Session()
-    s.trust_env = False
     code_str = ",".join(codes)
-    resp = s.get(f"https://qt.gtimg.cn/q={code_str}", timeout=10)
-    resp.encoding = "gbk"
+    with requests.Session() as session:
+        session.trust_env = False
+        resp = session.get(f"https://qt.gtimg.cn/q={code_str}", timeout=10)
+        resp.encoding = "gbk"
 
     results = {}
     for line in resp.text.strip().split(";"):
@@ -42,8 +42,6 @@ def analyze_valuation(symbol: str) -> str:
     - symbol: 股票/ETF代码
     """
     try:
-        s = requests.Session()
-        s.trust_env = False
         prefix = _q.code_prefix(symbol)
 
         # 获取当前数据
@@ -90,10 +88,12 @@ def analyze_valuation(symbol: str) -> str:
                 result += "  → 高估 ⚠️⚠️\n"
 
         # 获取历史数据计算位置
-        resp = s.get(
-            f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={prefix},day,,,250,qfq",
-            timeout=10
-        )
+        with requests.Session() as session:
+            session.trust_env = False
+            resp = session.get(
+                f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={prefix},day,,,250,qfq",
+                timeout=10
+            )
         kdata = resp.json()
         klines = kdata.get("data", {}).get(prefix, {}).get("day", [])
         if not klines:
@@ -248,8 +248,6 @@ def ai_stock_analysis(symbol: str) -> str:
     - symbol: 股票代码
     """
     try:
-        s = requests.Session()
-        s.trust_env = False
         prefix = _q.code_prefix(symbol)
 
         # 1. 获取基本面数据
@@ -265,10 +263,12 @@ def ai_stock_analysis(symbol: str) -> str:
         turnover = float(fields[38]) if fields[38] else 0
 
         # 2. 获取技术面数据
-        resp = s.get(
-            f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={prefix},day,,,60,qfq",
-            timeout=10
-        )
+        with requests.Session() as session:
+            session.trust_env = False
+            resp = session.get(
+                f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={prefix},day,,,60,qfq",
+                timeout=10
+            )
         kdata = resp.json()
         klines = kdata.get("data", {}).get(prefix, {}).get("day", [])
         if not klines:
@@ -292,11 +292,13 @@ def ai_stock_analysis(symbol: str) -> str:
         # 3. 获取相关新闻
         news = []
         try:
-            resp = s.get(
-                "https://feed.mix.sina.com.cn/api/roll/get",
-                params={"pageid": "153", "lid": "2516", "num": "30", "page": "1"},
-                timeout=5
-            )
+            with requests.Session() as session:
+                session.trust_env = False
+                resp = session.get(
+                    "https://feed.mix.sina.com.cn/api/roll/get",
+                    params={"pageid": "153", "lid": "2516", "num": "30", "page": "1"},
+                    timeout=5
+                )
             if resp.status_code == 200:
                 news_data = resp.json()
                 if news_data.get("result") and news_data["result"].get("data"):

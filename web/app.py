@@ -6,7 +6,9 @@ import sys
 import re
 import math
 import threading
+import time
 import uuid
+from collections import OrderedDict
 from datetime import datetime
 
 # Fix proxy issues
@@ -29,7 +31,70 @@ from tools import quote as _quote
 
 app = Flask(__name__)
 
+
+class _BoundedTTLCache:
+    """进程内线程安全的有界 TTL/LRU 缓存。"""
+
+    def __init__(self, maxsize, ttl):
+        self.maxsize = maxsize
+        self.ttl = ttl
+        self._items = OrderedDict()
+        self._lock = threading.Lock()
+
+    def get(self, key):
+        now = time.monotonic()
+        with self._lock:
+            item = self._items.get(key)
+            if item is None:
+                return None
+            if now - item[0] > self.ttl:
+                self._items.pop(key, None)
+                return None
+            self._items.move_to_end(key)
+            return item[1]
+
+    def set(self, key, value):
+        now = time.monotonic()
+        with self._lock:
+            self._items[key] = (now, value)
+            self._items.move_to_end(key)
+            expired = [k for k, (created, _) in self._items.items()
+                       if now - created > self.ttl]
+            for expired_key in expired:
+                self._items.pop(expired_key, None)
+            while len(self._items) > self.maxsize:
+                self._items.popitem(last=False)
+
+    def __len__(self):
+        with self._lock:
+            return len(self._items)
+
+
 _agent_executor = None
+_agent_lock = threading.Lock()
+_news_pool_cache = _BoundedTTLCache(maxsize=1, ttl=120)
+_news_fetch_lock = threading.Lock()
+_news_sentiment_cache = _BoundedTTLCache(maxsize=256, ttl=6 * 3600)
+_sector_analysis_cache = _BoundedTTLCache(maxsize=256, ttl=6 * 3600)
+_analysis_llm = None
+_analysis_llm_lock = threading.Lock()
+_ai_invoke_lock = threading.Lock()
+
+
+def _get_analysis_llm():
+    """复用低温度分析模型客户端，避免每个请求重复构造。"""
+    global _analysis_llm
+    if _analysis_llm is None:
+        with _analysis_llm_lock:
+            if _analysis_llm is None:
+                from langchain_openai import ChatOpenAI
+                _analysis_llm = ChatOpenAI(
+                    model="deepseek-chat",
+                    api_key=os.getenv("DEEPSEEK_API_KEY"),
+                    base_url="https://api.deepseek.com",
+                    temperature=0.1,
+                )
+    return _analysis_llm
 
 # 可选的写接口鉴权：在 .env 配置 DASHBOARD_TOKEN 后，所有写操作(POST)需带
 # 请求头 X-Auth-Token 或 ?token= 才放行。未配置则不强制（本地自用），
@@ -72,8 +137,10 @@ def _release_data_write_lock(_error=None):
 def get_agent():
     global _agent_executor
     if _agent_executor is None:
-        from agents import create_investment_agent
-        _agent_executor = create_investment_agent()
+        with _agent_lock:
+            if _agent_executor is None:
+                from agents import create_investment_agent
+                _agent_executor = create_investment_agent()
     return _agent_executor
 
 
@@ -158,9 +225,10 @@ def api_market_overview():
 
 @app.route("/api/stock/<symbol>", methods=["GET"])
 def api_stock_info(symbol):
+    if not _quote.is_valid_symbol(symbol):
+        return jsonify({"error": "Invalid stock symbol"}), 400
     try:
         code = _quote.code_prefix(symbol)
-        
         data = _tencent_request([code])
         if code not in data:
             return jsonify({"error": f"Stock {symbol} not found"}), 404
@@ -540,110 +608,150 @@ def _fetch_eastmoney_news(session):
 
 
 def _dedup_news(news_list):
-    """标题去重：完全相同/前16字相同/互为子串/高相似度，以及东财同关联个股且时间相近，均视为重复"""
+    """用哈希索引缩小候选集，再做精确相似度判断，避免全量 O(n²) 比较。"""
     from difflib import SequenceMatcher
-    kept = []  # [(norm, item)]
+
+    kept = []  # [(norm, item, stock_set, ts)]
     result = []
-    for n in news_list:
-        norm = re.sub(r"[\s\W]+", "", n["title"])
-        if not norm:
+    exact_titles = set()
+    prefix16 = set()
+    buckets = {}
+
+    for news in news_list:
+        norm = re.sub(r"[\s\W]+", "", news["title"])
+        if not norm or norm in exact_titles:
             continue
-        sl = set(n.get("stockList") or [])
-        ts = n.get("ts") or 0
-        dup = False
-        for m_norm, m in kept:
-            if norm == m_norm:
-                dup = True
-                break
-            if len(norm) >= 16 and len(m_norm) >= 16 and norm[:16] == m_norm[:16]:
-                dup = True
-                break
-            # 一条是另一条的删减/扩写（纯转载）
-            short, long = (norm, m_norm) if len(norm) <= len(m_norm) else (m_norm, norm)
+        if len(norm) >= 16 and norm[:16] in prefix16:
+            continue
+
+        stock_set = {str(code) for code in (news.get("stockList") or [])}
+        timestamp = news.get("ts") or 0
+        # 同源改写通常保持标题尾部，前16字相同已在上方 O(1) 处理；
+        # 首尾联合签名避免财经标题常见前缀造成超大候选桶。
+        keys = {("edge", norm[:8], norm[-8:])}
+        if len(norm) >= 12:
+            keys.add(("tail", norm[-12:]))
+        keys.update(("stock", code) for code in stock_set)
+        candidate_indexes = set()
+        for key in keys:
+            candidate_indexes.update(buckets.get(key, ()))
+
+        duplicate = False
+        for index in candidate_indexes:
+            other_norm, other, other_stocks, other_ts = kept[index]
+            short, long = ((norm, other_norm) if len(norm) <= len(other_norm)
+                           else (other_norm, norm))
             if len(short) >= 12 and short in long:
-                dup = True
+                duplicate = True
                 break
-            # 标题高相似度（跨源转载，阈值较高避免误删）
-            if len(norm) >= 12 and len(m_norm) >= 12 and \
-                    SequenceMatcher(None, norm, m_norm).ratio() >= 0.82:
-                dup = True
+            if (len(norm) >= 12 and len(other_norm) >= 12 and
+                    SequenceMatcher(None, norm, other_norm).ratio() >= 0.82):
+                duplicate = True
                 break
-            # 东财：关联同一个股且时间相近（6小时内）视为同一事件
-            msl = set(m.get("stockList") or [])
-            if sl and msl and (sl & msl) and abs(ts - (m.get("ts") or 0)) <= 21600:
-                dup = True
+            if (stock_set and other_stocks and stock_set & other_stocks and
+                    abs(timestamp - other_ts) <= 21600):
+                duplicate = True
                 break
-        if not dup:
-            kept.append((norm, n))
-            result.append(n)
+
+        if duplicate:
+            continue
+
+        index = len(kept)
+        kept.append((norm, news, stock_set, timestamp))
+        result.append(news)
+        exact_titles.add(norm)
+        if len(norm) >= 16:
+            prefix16.add(norm[:16])
+        for key in keys:
+            buckets.setdefault(key, []).append(index)
+
     return result
 
 
+def _clone_news_pool(pool):
+    """请求会补充展示字段，返回浅拷贝避免并发请求修改缓存原件。"""
+    return [dict(item, stockList=list(item.get("stockList") or [])) for item in pool]
+
+
+def _get_news_pool():
+    """共享两分钟新闻池，并将并发缓存未命中合并为一次上游抓取。"""
+    cached = _news_pool_cache.get("all")
+    if cached is not None:
+        return _clone_news_pool(cached)
+
+    with _news_fetch_lock:
+        cached = _news_pool_cache.get("all")
+        if cached is None:
+            with requests.Session() as session:
+                session.trust_env = False
+                fetched = _fetch_sina_news(session) + _fetch_eastmoney_news(session)
+            cached = _dedup_news(fetched)
+            _news_pool_cache.set("all", cached)
+    return _clone_news_pool(cached)
+
+
 def _analyze_news_sentiment(news_items):
-    """用 DeepSeek 批量判断新闻影响等级(五档)+理由，并对关键词粗筛出的“持仓相关”
-    新闻做语义相关性精排（AI 判为无关则降级）。带缓存，失败静默跳过。"""
+    """批量判断新闻影响；结果有界缓存，同一进程内合并并发模型调用。"""
     if not news_items:
         return
 
-    def _apply(n, r):
-        n["sentiment"] = r.get("s")
-        n["reason"] = r.get("r", "")
-        # AI 精排：关键词命中但 AI 判定实质无关的，降级为普通新闻
-        if n.get("matched") and r.get("rel") == 0:
-            n["related"] = False
-            n["matched"] = []
-            n["ai_rejected"] = True
+    def apply_result(news, result):
+        news["sentiment"] = result.get("s")
+        news["reason"] = result.get("r", "")
+        if news.get("matched") and result.get("rel") == 0:
+            news["related"] = False
+            news["matched"] = []
+            news["ai_rejected"] = True
 
     import hashlib
     cache_key = hashlib.md5("".join(n["title"] for n in news_items).encode()).hexdigest()[:10]
-    if not hasattr(_analyze_news_sentiment, "_cache"):
-        _analyze_news_sentiment._cache = {}
-    cached = _analyze_news_sentiment._cache.get(cache_key)
-    if cached:
-        for n, r in zip(news_items, cached):
-            _apply(n, r)
+    cached = _news_sentiment_cache.get(cache_key)
+    if cached is not None:
+        for news, result in zip(news_items, cached):
+            apply_result(news, result)
         return
 
     try:
         import json as json_mod
-        from langchain_openai import ChatOpenAI
-        llm = ChatOpenAI(
-            model="deepseek-chat",
-            api_key=os.getenv("DEEPSEEK_API_KEY"),
-            base_url="https://api.deepseek.com",
-            temperature=0.1,
-        )
-        lines = []
-        for i, n in enumerate(news_items):
-            line = f"{i+1}. {n['title']}"
-            if n.get("summary"):
-                line += f"（{n['summary'][:50]}）"
-            if n.get("matched"):
-                line += f" [关联标的:{'/'.join(n['matched'])}]"
-            lines.append(line)
-        prompt = (
-            "你是A股投资分析助手。对下列每条新闻给出三项：\n"
-            "s：影响等级，只能从“非常利好”“利好”“中性”“利空”“非常利空”五档选一，"
-            "只有影响重大、可能引发明显异动才用“非常”；\n"
-            "r：不超过20字的理由；\n"
-            "rel：仅当该条标注了“关联标的”时判断——新闻内容确实关系到该标的/板块基本面填1，"
-            "只是文字上恰好出现该词、实质无关（如讲的是别的东西）填0；没有关联标的的填1。\n"
-            '严格只输出JSON数组，格式：[{"i":1,"s":"利好","r":"降准利好银行息差","rel":1}]，'
-            "不要多余文字。\n\n新闻：\n" + "\n".join(lines)
-        )
-        resp = llm.invoke(prompt)
-        content = resp.content.strip()
-        match = re.search(r"\[.*\]", content, re.DOTALL)
-        if match:
-            arr = json_mod.loads(match.group(0))
-            result = [{} for _ in news_items]
-            for obj in arr:
-                idx = int(obj.get("i", 0)) - 1
-                if 0 <= idx < len(news_items):
-                    result[idx] = {"s": obj.get("s"), "r": obj.get("r", ""), "rel": obj.get("rel", 1)}
-            for n, r in zip(news_items, result):
-                _apply(n, r)
-            _analyze_news_sentiment._cache[cache_key] = result
+        with _ai_invoke_lock:
+            # 等待期间相同请求可能已经完成，再检查一次避免重复计费。
+            cached = _news_sentiment_cache.get(cache_key)
+            if cached is None:
+                lines = []
+                for index, news in enumerate(news_items):
+                    line = f"{index + 1}. {news['title']}"
+                    if news.get("summary"):
+                        line += f"（{news['summary'][:50]}）"
+                    if news.get("matched"):
+                        line += f" [关联标的:{'/'.join(news['matched'])}]"
+                    lines.append(line)
+                prompt = (
+                    "你是A股投资分析助手。对下列每条新闻给出三项：\n"
+                    "s：影响等级，只能从“非常利好”“利好”“中性”“利空”“非常利空”五档选一，"
+                    "只有影响重大、可能引发明显异动才用“非常”；\n"
+                    "r：不超过20字的理由；\n"
+                    "rel：仅当该条标注了“关联标的”时判断——新闻内容确实关系到该标的/板块基本面填1，"
+                    "只是文字上恰好出现该词、实质无关填0；没有关联标的的填1。\n"
+                    '严格只输出JSON数组，格式：[{"i":1,"s":"利好","r":"降准利好银行息差","rel":1}]，'
+                    "不要多余文字。\n\n新闻：\n" + "\n".join(lines)
+                )
+                content = _get_analysis_llm().invoke(prompt).content.strip()
+                match = re.search(r"\[.*\]", content, re.DOTALL)
+                if not match:
+                    return
+                parsed = json_mod.loads(match.group(0))
+                cached = [{} for _ in news_items]
+                for item in parsed:
+                    index = int(item.get("i", 0)) - 1
+                    if 0 <= index < len(news_items):
+                        cached[index] = {
+                            "s": item.get("s"), "r": item.get("r", ""),
+                            "rel": item.get("rel", 1),
+                        }
+                _news_sentiment_cache.set(cache_key, cached)
+
+        for news, result in zip(news_items, cached):
+            apply_result(news, result)
     except Exception:
         pass  # 余额不足或无 key，静默跳过
 
@@ -660,20 +768,13 @@ def api_daily_news():
         recent_hours = int(request.args.get("hours", 48))
         cutoff = int(_time.time()) - recent_hours * 3600
 
-        s = requests.Session()
-        s.trust_env = False
-
-        # 1) 多源抓取
-        news_list = _fetch_sina_news(s) + _fetch_eastmoney_news(s)
-
-        # 2) 去财经噪音
-        news_list = [n for n in news_list if _is_finance_news(n["title"], n["summary"])]
-
-        # 3) 近似去重
-        news_list = _dedup_news(news_list)
-
-        # 4) 时效过滤：保留最近 N 小时（无时间的保留）
-        news_list = [n for n in news_list if (not n["ts"]) or n["ts"] >= cutoff]
+        # 共享两分钟新闻池；先做时效/财经过滤，再进入后续分类。
+        news_list = _get_news_pool()
+        news_list = [
+            news for news in news_list
+            if ((not news["ts"]) or news["ts"] >= cutoff)
+            and _is_finance_news(news["title"], news["summary"])
+        ]
 
         # 5) 分类 + 持仓精准联动 + 重磅标记 + 时间
         keywords = _watchlist_keywords()
@@ -793,23 +894,11 @@ def api_bank_sector():
 
         all_codes = sorted({code for sector in sectors_config for code in sector.get("stocks", [])})
 
-        def load_news_pool():
-            import time as time_mod
-            now = time_mod.time()
-            cached = getattr(api_bank_sector, "_news_cache", None)
-            if cached and now - cached[0] <= 120:
-                return cached[1]
-            with requests.Session() as session:
-                session.trust_env = False
-                pool = _dedup_news(_fetch_sina_news(session) + _fetch_eastmoney_news(session))
-            api_bank_sector._news_cache = (now, pool)
-            return pool
-
-        # 行情和新闻来源互不依赖，并行获取；新闻池只抓一次供所有板块过滤。
+        # 行情和新闻来源互不依赖，并行获取；新闻池跨接口共享并带 single-flight。
         from concurrent.futures import ThreadPoolExecutor
         with ThreadPoolExecutor(max_workers=2) as executor:
             quotes_future = executor.submit(_quote.get_quotes, all_codes)
-            news_future = executor.submit(load_news_pool)
+            news_future = executor.submit(_get_news_pool)
             quotes = quotes_future.result()
             news_pool = news_future.result()
 
@@ -872,28 +961,22 @@ def api_bank_sector():
                 import hashlib
                 news_hash = hashlib.md5("".join(news).encode()).hexdigest()[:8]
                 cache_key = f"{sector['name']}_{news_hash}"
-                if not hasattr(api_bank_sector, "_analysis_cache"):
-                    api_bank_sector._analysis_cache = {}
-                cached_analysis = api_bank_sector._analysis_cache.get(cache_key)
-                if cached_analysis:
+                cached_analysis = _sector_analysis_cache.get(cache_key)
+                if cached_analysis is not None:
                     sector_data["analysis"] = cached_analysis
                 else:
                     try:
-                        from langchain_openai import ChatOpenAI
-                        llm = ChatOpenAI(
-                            model="deepseek-chat",
-                            api_key=os.getenv("DEEPSEEK_API_KEY"),
-                            base_url="https://api.deepseek.com",
-                            temperature=0.1,
-                        )
-                        prompt = (
-                            f"根据以下新闻，判断对{sector['name']}板块的影响。用1句话总结，"
-                            '格式：“利好/利空/中性，因为xxx”\n\n新闻：\n' +
-                            "\n".join(news) + "\n\n结论："
-                        )
-                        analysis = llm.invoke(prompt).content.strip()
-                        sector_data["analysis"] = analysis
-                        api_bank_sector._analysis_cache[cache_key] = analysis
+                        with _ai_invoke_lock:
+                            cached_analysis = _sector_analysis_cache.get(cache_key)
+                            if cached_analysis is None:
+                                prompt = (
+                                    f"根据以下新闻，判断对{sector['name']}板块的影响。用1句话总结，"
+                                    '格式：“利好/利空/中性，因为xxx”\n\n新闻：\n' +
+                                    "\n".join(news) + "\n\n结论："
+                                )
+                                cached_analysis = _get_analysis_llm().invoke(prompt).content.strip()
+                                _sector_analysis_cache.set(cache_key, cached_analysis)
+                        sector_data["analysis"] = cached_analysis
                     except Exception as error:
                         if "Insufficient Balance" in str(error):
                             sector_data["analysis"] = "API余额不足"
@@ -1179,16 +1262,17 @@ def api_stock_search():
     if len(query) > 30:
         return jsonify({"error": "搜索内容过长"}), 400
     try:
-        s = requests.Session()
-        s.trust_env = False
-        resp = s.get(
-            "https://smartbox.gtimg.cn/s3/",
-            params={"q": query, "t": "all"},
-            timeout=8,
-            headers={"User-Agent": "Mozilla/5.0"},
-        )
-        resp.encoding = "gbk"
-        match = re.search(r'v_hint="(.*)"', resp.text.strip())
+        with requests.Session() as session:
+            session.trust_env = False
+            resp = session.get(
+                "https://smartbox.gtimg.cn/s3/",
+                params={"q": query, "t": "all"},
+                timeout=8,
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+            resp.encoding = "gbk"
+            response_text = resp.text
+        match = re.search(r'v_hint="(.*)"', response_text.strip())
         if not match:
             return jsonify({"results": []})
         # 接口中的中文使用 JSON unicode 转义，借助 json 安全还原。
@@ -2149,16 +2233,17 @@ def api_chat_history_clear():
 def api_ai_balance():
     """Query DeepSeek API balance"""
     try:
-        s = requests.Session()
-        s.trust_env = False
         api_key = os.getenv("DEEPSEEK_API_KEY")
-        resp = s.get(
-            "https://api.deepseek.com/user/balance",
-            headers={"Authorization": f"Bearer {api_key}"},
-            timeout=10
-        )
-        if resp.status_code == 200:
-            data = resp.json()
+        with requests.Session() as session:
+            session.trust_env = False
+            resp = session.get(
+                "https://api.deepseek.com/user/balance",
+                headers={"Authorization": f"Bearer {api_key}"},
+                timeout=10,
+            )
+            status_code = resp.status_code
+            data = resp.json() if status_code == 200 else None
+        if status_code == 200:
             if data.get("balance_infos"):
                 info = data["balance_infos"][0]
                 return jsonify({
@@ -2174,7 +2259,7 @@ def api_ai_balance():
                 "granted": data.get("granted_balance", "0"),
                 "currency": data.get("currency", "CNY"),
             })
-        return jsonify({"error": f"API returned {resp.status_code}"}), 500
+        return jsonify({"error": f"API returned {status_code}"}), 500
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -2271,31 +2356,23 @@ def api_sector_rotation():
 def api_sector_rotation_history():
     """获取板块近期走势对比"""
     try:
-        from tools.sector_rotation import SECTOR_ETFS
-        s = requests.Session()
-        s.trust_env = False
+        from tools.sector_rotation import get_sector_history
+        histories = get_sector_history(20)
         result = {}
 
-        for sector_name, etf_code in SECTOR_ETFS.items():
+        for sector_name, klines in histories.items():
             try:
-                resp = s.get(
-                    f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={etf_code},day,,,20,qfq",
-                    timeout=5
-                )
-                data = resp.json()
-                klines = data.get("data", {}).get(etf_code, {}).get("day", [])
-                if not klines:
-                    klines = data.get("data", {}).get(etf_code, {}).get("qfqday", [])
-                if klines and len(klines) >= 5:
-                    closes = [float(k[2]) for k in klines]
-                    base = closes[0]
-                    result[sector_name] = {
-                        "dates": [k[0] for k in klines],
-                        "returns": [round((c / base - 1) * 100, 2) for c in closes],
-                        "pct_5d": round((closes[-1] / closes[-5] - 1) * 100, 2) if len(closes) >= 5 else 0,
-                        "pct_20d": round((closes[-1] / closes[0] - 1) * 100, 2),
-                    }
-            except:
+                if len(klines) < 5:
+                    continue
+                closes = [float(k[2]) for k in klines]
+                base = closes[0]
+                result[sector_name] = {
+                    "dates": [k[0] for k in klines],
+                    "returns": [round((close / base - 1) * 100, 2) for close in closes],
+                    "pct_5d": round((closes[-1] / closes[-5] - 1) * 100, 2),
+                    "pct_20d": round((closes[-1] / closes[0] - 1) * 100, 2),
+                }
+            except (IndexError, TypeError, ValueError, ZeroDivisionError):
                 continue
 
         return jsonify({"sectors": result})
@@ -2399,76 +2476,91 @@ def api_add_position_calc():
         return jsonify({"error": str(e)}), 500
 
 
+_signal_monitor_lock = threading.Lock()
+_signal_monitor_stop = threading.Event()
+_signal_monitor_thread = None
+
+
+def _extract_signal_direction(signal_text):
+    if "重仓加仓" in signal_text:
+        return "add_heavy"
+    if "适合加仓" in signal_text:
+        return "add"
+    if "小幅加仓" in signal_text:
+        return "add_light"
+    if "止盈" in signal_text:
+        return "take_profit"
+    if "减仓" in signal_text:
+        return "sell"
+    return "hold"
+
+
+def _signal_monitor_loop():
+    last_directions = {}
+    while not _signal_monitor_stop.is_set():
+        try:
+            now = datetime.now()
+            if now.weekday() < 5 and 9 <= now.hour <= 14:
+                from agents import RiskMonitor
+                monitor = RiskMonitor()
+                signals = monitor.get_signals()
+                current_directions = {}
+                has_actionable = False
+                for signal in signals:
+                    signal_text = signal["signal"]
+                    current_directions[signal["code"]] = _extract_signal_direction(signal_text)
+                    if any(keyword in signal_text for keyword in ["加仓", "止盈", "减仓"]):
+                        has_actionable = True
+
+                has_change = any(
+                    last_directions.get(code) != direction
+                    for code, direction in current_directions.items()
+                )
+                if has_change and has_actionable:
+                    last_directions.update(current_directions)
+                    message = f"📊 操作信号更新 ({now.strftime('%H:%M')})\n\n"
+                    for signal in signals:
+                        held = "[持仓]" if signal["code"] in monitor.portfolio else "[观察]"
+                        message += f"▸ {signal['name']}({signal['code']}) {held}\n"
+                        message += f"  {signal['signal']}\n\n"
+                    _send_notification("DataBoard 操作信号", message)
+                elif has_change:
+                    last_directions.update(current_directions)
+        except Exception:
+            pass
+
+        # Event.wait 可被 stop 立即唤醒，避免 sleep 导致线程无法及时退出。
+        _signal_monitor_stop.wait(30 * 60)
+
+
 def start_signal_monitor():
-    """Background thread that checks signals every 30 minutes during trading hours"""
-    import threading
-    import time
+    """幂等启动后台信号监控，同一进程最多一个线程。"""
+    global _signal_monitor_thread
+    with _signal_monitor_lock:
+        if _signal_monitor_thread and _signal_monitor_thread.is_alive():
+            return _signal_monitor_thread
+        _signal_monitor_stop.clear()
+        _signal_monitor_thread = threading.Thread(
+            target=_signal_monitor_loop,
+            name="signal-monitor",
+            daemon=True,
+        )
+        _signal_monitor_thread.start()
+        return _signal_monitor_thread
 
-    def _extract_direction(signal_text):
-        """提取操作方向，忽略具体数字变化"""
-        if "重仓加仓" in signal_text:
-            return "add_heavy"
-        elif "适合加仓" in signal_text:
-            return "add"
-        elif "小幅加仓" in signal_text:
-            return "add_light"
-        elif "止盈" in signal_text:
-            return "take_profit"
-        elif "减仓" in signal_text:
-            return "sell"
-        else:
-            return "hold"
 
-    def monitor_loop():
-        last_directions = {}  # {code: direction} for all stocks
-        while True:
-            try:
-                now = datetime.now()
-                # Only check during trading hours (9:30-15:00, weekdays)
-                if now.weekday() < 5 and 9 <= now.hour <= 14:
-                    from agents import RiskMonitor
-                    monitor = RiskMonitor()
-                    signals = monitor.get_signals()
-
-                    # Calculate current directions for all stocks
-                    current_directions = {}
-                    has_actionable = False
-                    for sig in signals:
-                        signal_text = sig["signal"]
-                        direction = _extract_direction(signal_text)
-                        current_directions[sig["code"]] = direction
-                        if any(kw in signal_text for kw in ["加仓", "止盈", "减仓"]):
-                            has_actionable = True
-
-                    # Check if any stock's direction changed
-                    has_change = False
-                    for code, direction in current_directions.items():
-                        if last_directions.get(code) != direction:
-                            has_change = True
-                            break
-
-                    # If any direction changed and at least one has action, send ALL stocks
-                    if has_change and has_actionable:
-                        last_directions.update(current_directions)
-                        message = f"📊 操作信号更新 ({now.strftime('%H:%M')})\n\n"
-                        for sig in signals:
-                            held = "[持仓]" if sig["code"] in monitor.portfolio else "[观察]"
-                            message += f"▸ {sig['name']}({sig['code']}) {held}\n"
-                            message += f"  {sig['signal']}\n\n"
-                        _send_notification("DataBoard 操作信号", message)
-                    elif not has_change:
-                        pass  # No change, no notification
-                    else:
-                        last_directions.update(current_directions)
-
-            except Exception as e:
-                pass
-
-            # Check every 30 minutes
-            time.sleep(30 * 60)
-
-    t = threading.Thread(target=monitor_loop, daemon=True)
-    t.start()
+def stop_signal_monitor(timeout=2):
+    """停止后台信号监控，主要供嵌入式运行和测试清理使用。"""
+    global _signal_monitor_thread
+    with _signal_monitor_lock:
+        thread = _signal_monitor_thread
+        if not thread:
+            return
+        _signal_monitor_stop.set()
+    thread.join(timeout=timeout)
+    with _signal_monitor_lock:
+        if not thread.is_alive() and _signal_monitor_thread is thread:
+            _signal_monitor_thread = None
 
 
 def _send_notification(title, content):
@@ -2476,19 +2568,19 @@ def _send_notification(title, content):
     bark_url = os.getenv("BARK_URL")
     if bark_url:
         try:
-            s = requests.Session()
-            s.trust_env = False
-            # 用 POST 表单提交，避免长文本/换行撑爆 URL
-            s.post(
-                bark_url.rstrip("/"),
-                data={
-                    "title": title,
-                    "body": content,
-                    "group": "DataBoard",
-                    "icon": "https://img.icons8.com/color/96/combo-chart.png",
-                },
-                timeout=10,
-            )
+            with requests.Session() as session:
+                session.trust_env = False
+                # 用 POST 表单提交，避免长文本/换行撑爆 URL
+                session.post(
+                    bark_url.rstrip("/"),
+                    data={
+                        "title": title,
+                        "body": content,
+                        "group": "DataBoard",
+                        "icon": "https://img.icons8.com/color/96/combo-chart.png",
+                    },
+                    timeout=10,
+                )
             return True
         except Exception:
             pass

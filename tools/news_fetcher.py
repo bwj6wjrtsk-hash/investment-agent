@@ -9,13 +9,13 @@ from langchain_core.tools import tool
 def get_financial_news(count: int = 10) -> str:
     """获取最新财经新闻。参数 count 为获取条数，默认10条。"""
     try:
-        s = requests.Session()
-        s.trust_env = False
-        resp = s.get(
-            "https://feed.mix.sina.com.cn/api/roll/get",
-            params={"pageid": "153", "lid": "2516", "num": str(count), "page": "1"},
-            timeout=10
-        )
+        with requests.Session() as session:
+            session.trust_env = False
+            resp = session.get(
+                "https://feed.mix.sina.com.cn/api/roll/get",
+                params={"pageid": "153", "lid": "2516", "num": str(count), "page": "1"},
+                timeout=10
+            )
         if resp.status_code != 200:
             return "获取新闻失败"
 
@@ -41,15 +41,15 @@ def get_financial_news(count: int = 10) -> str:
 def get_stock_news(symbol: str, count: int = 5) -> str:
     """获取个股/板块相关新闻。输入关键词如股票名称或代码。"""
     try:
-        s = requests.Session()
-        s.trust_env = False
+        with requests.Session() as session:
+            session.trust_env = False
 
-        # Search for related news
-        resp = s.get(
-            "https://feed.mix.sina.com.cn/api/roll/get",
-            params={"pageid": "153", "lid": "2516", "num": "30", "page": "1"},
-            timeout=10
-        )
+            # Search for related news
+            resp = session.get(
+                "https://feed.mix.sina.com.cn/api/roll/get",
+                params={"pageid": "153", "lid": "2516", "num": "30", "page": "1"},
+                timeout=10
+            )
         if resp.status_code != 200:
             return f"获取 {symbol} 新闻失败"
 
@@ -79,8 +79,6 @@ def get_sector_fund_flow() -> str:
     """获取行业板块资金流向/涨跌情况。"""
     try:
         import json
-        s = requests.Session()
-        s.trust_env = False
 
         # Get multiple sectors
         sectors = {
@@ -101,11 +99,13 @@ def get_sector_fund_flow() -> str:
 
         for node, name in sectors.items():
             try:
-                resp = s.get(
-                    "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData",
-                    params={"page": "1", "num": "3", "sort": "changepercent", "asc": "0", "node": node},
-                    timeout=5
-                )
+                with requests.Session() as session:
+                    session.trust_env = False
+                    resp = session.get(
+                        "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData",
+                        params={"page": "1", "num": "3", "sort": "changepercent", "asc": "0", "node": node},
+                        timeout=5
+                    )
                 if resp.status_code == 200 and resp.text.strip() != "[]":
                     items = json.loads(resp.text)
                     if items:
@@ -129,14 +129,14 @@ def get_hot_stocks() -> str:
     """获取今日涨幅最大的股票。"""
     try:
         import json
-        s = requests.Session()
-        s.trust_env = False
 
-        resp = s.get(
-            "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData",
-            params={"page": "1", "num": "15", "sort": "changepercent", "asc": "0", "node": "hs_a"},
-            timeout=10
-        )
+        with requests.Session() as session:
+            session.trust_env = False
+            resp = session.get(
+                "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData",
+                params={"page": "1", "num": "15", "sort": "changepercent", "asc": "0", "node": "hs_a"},
+                timeout=10
+            )
         if resp.status_code != 200:
             return "获取热门股票失败"
 

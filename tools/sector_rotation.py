@@ -7,7 +7,9 @@
 import json
 import os
 import re
-import requests
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, date, timedelta
 from langchain_core.tools import tool
 
@@ -51,6 +53,54 @@ SECTOR_ETFS = {
     "电力": "sz159611",
     "人工智能": "sh515070",
 }
+
+_SECTOR_HISTORY_TTL = 300
+_SECTOR_HISTORY_CACHE = {}  # days -> (monotonic timestamp, {sector: klines})
+_SECTOR_HISTORY_LOCK = threading.Lock()
+_SECTOR_HISTORY_FETCH_LOCK = threading.Lock()
+
+
+def get_sector_history(days: int = 20) -> dict:
+    """并行获取板块 K 线并缓存整组结果，避免 13 个串行网络请求。"""
+    days = max(5, min(int(days), 120))
+
+    def cached_result():
+        cached = _SECTOR_HISTORY_CACHE.get(days)
+        if cached and time.monotonic() - cached[0] <= _SECTOR_HISTORY_TTL:
+            return cached[1]
+        if cached:
+            _SECTOR_HISTORY_CACHE.pop(days, None)
+        return None
+
+    with _SECTOR_HISTORY_LOCK:
+        cached = cached_result()
+        if cached is not None:
+            return cached
+
+    # 整组数据只允许一个线程刷新；其余请求等待并复用结果。
+    with _SECTOR_HISTORY_FETCH_LOCK:
+        with _SECTOR_HISTORY_LOCK:
+            cached = cached_result()
+            if cached is not None:
+                return cached
+
+        def fetch(item):
+            sector_name, etf_code = item
+            return sector_name, _q.get_klines_raw(etf_code, days)
+
+        result = {}
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            for sector_name, klines in executor.map(fetch, SECTOR_ETFS.items()):
+                if klines:
+                    result[sector_name] = klines
+
+        with _SECTOR_HISTORY_LOCK:
+            _SECTOR_HISTORY_CACHE[days] = (time.monotonic(), result)
+            # 当前只会使用 20/60 日；仍设置硬上限防止未来参数扩展后增长。
+            while len(_SECTOR_HISTORY_CACHE) > 3:
+                oldest = min(_SECTOR_HISTORY_CACHE, key=lambda key: _SECTOR_HISTORY_CACHE[key][0])
+                _SECTOR_HISTORY_CACHE.pop(oldest, None)
+        return result
 
 
 def _get_sector_prices() -> dict:
@@ -122,47 +172,29 @@ def get_sector_strength_ranking() -> str:
 def detect_rotation_signal() -> str:
     """检测板块轮动信号（基于近期板块相对强度变化）。"""
     try:
-        s = requests.Session()
-        s.trust_env = False
-
         result = "=== 板块轮动信号 ===\n\n"
 
-        # 获取各板块ETF近20日涨跌幅
+        # 整组近20日 K 线最多 4 路并发，并共享 5 分钟缓存。
+        histories = get_sector_history(20)
         sector_performance = {}
-        for sector_name, etf_code in SECTOR_ETFS.items():
+        for sector_name, klines in histories.items():
             try:
-                resp = s.get(
-                    f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={etf_code},day,,,20,qfq",
-                    timeout=5
-                )
-                data = resp.json()
-                klines = data.get("data", {}).get(etf_code, {}).get("day", [])
-                if not klines:
-                    klines = data.get("data", {}).get(etf_code, {}).get("qfqday", [])
+                if len(klines) < 10:
+                    continue
+                closes = [float(k[2]) for k in klines]
+                pct_5d = (closes[-1] / closes[-5] - 1) * 100
+                pct_10d = (closes[-1] / closes[-10] - 1) * 100
+                pct_20d = (closes[-1] / closes[0] - 1) * 100
+                recent_5 = (closes[-1] / closes[-5] - 1) * 100
+                prev_5 = (closes[-6] / closes[-10] - 1) * 100
 
-                if klines and len(klines) >= 10:
-                    closes = [float(k[2]) for k in klines]
-                    # 近5日涨幅
-                    pct_5d = (closes[-1] / closes[-5] - 1) * 100 if len(closes) >= 5 else 0
-                    # 近10日涨幅
-                    pct_10d = (closes[-1] / closes[-10] - 1) * 100 if len(closes) >= 10 else 0
-                    # 近20日涨幅
-                    pct_20d = (closes[-1] / closes[0] - 1) * 100
-
-                    # 动量变化：近5日 vs 前5日
-                    momentum_change = 0
-                    if len(closes) >= 10:
-                        recent_5 = (closes[-1] / closes[-5] - 1) * 100
-                        prev_5 = (closes[-6] / closes[-10] - 1) * 100
-                        momentum_change = recent_5 - prev_5
-
-                    sector_performance[sector_name] = {
-                        "pct_5d": pct_5d,
-                        "pct_10d": pct_10d,
-                        "pct_20d": pct_20d,
-                        "momentum_change": momentum_change,
-                    }
-            except:
+                sector_performance[sector_name] = {
+                    "pct_5d": pct_5d,
+                    "pct_10d": pct_10d,
+                    "pct_20d": pct_20d,
+                    "momentum_change": recent_5 - prev_5,
+                }
+            except (IndexError, TypeError, ValueError, ZeroDivisionError):
                 continue
 
         if not sector_performance:
@@ -216,44 +248,32 @@ def compare_sectors(sector1: str, sector2: str) -> str:
     - sector2: 板块名称，如 '证券'
     """
     try:
-        s = requests.Session()
-        s.trust_env = False
-
         if sector1 not in SECTOR_ETFS:
             return f"不支持的板块: {sector1}。可选: {', '.join(SECTOR_ETFS.keys())}"
         if sector2 not in SECTOR_ETFS:
             return f"不支持的板块: {sector2}。可选: {', '.join(SECTOR_ETFS.keys())}"
 
         result = f"=== {sector1} vs {sector2} 对比 ===\n\n"
+        names = [sector1, sector2]
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            closes_by_sector = dict(zip(
+                names,
+                executor.map(lambda name: _q.get_closes(SECTOR_ETFS[name], 60), names),
+            ))
 
-        for sector_name in [sector1, sector2]:
-            etf_code = SECTOR_ETFS[sector_name]
-            resp = s.get(
-                f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={etf_code},day,,,60,qfq",
-                timeout=10
-            )
-            data = resp.json()
-            klines = data.get("data", {}).get(etf_code, {}).get("day", [])
-            if not klines:
-                klines = data.get("data", {}).get(etf_code, {}).get("qfqday", [])
-
-            if not klines or len(klines) < 20:
+        for sector_name in names:
+            closes = closes_by_sector.get(sector_name)
+            if not closes or len(closes) < 20:
                 result += f"{sector_name}: 数据不足\n"
                 continue
 
-            closes = [float(k[2]) for k in klines]
-            current = closes[-1]
-
-            pct_5d = (closes[-1] / closes[-5] - 1) * 100 if len(closes) >= 5 else 0
-            pct_10d = (closes[-1] / closes[-10] - 1) * 100 if len(closes) >= 10 else 0
-            pct_20d = (closes[-1] / closes[-20] - 1) * 100 if len(closes) >= 20 else 0
+            pct_5d = (closes[-1] / closes[-5] - 1) * 100
+            pct_10d = (closes[-1] / closes[-10] - 1) * 100
+            pct_20d = (closes[-1] / closes[-20] - 1) * 100
             pct_60d = (closes[-1] / closes[0] - 1) * 100
 
-            # 波动率
-            returns = [(closes[i]/closes[i-1]-1)*100 for i in range(1, len(closes))]
-            volatility = (sum(r**2 for r in returns) / len(returns)) ** 0.5
-
-            # RSI (标准 Wilder)
+            returns = [(closes[i] / closes[i - 1] - 1) * 100 for i in range(1, len(closes))]
+            volatility = (sum(r ** 2 for r in returns) / len(returns)) ** 0.5
             rsi = _q.compute_rsi(closes)
             rsi = rsi if rsi is not None else 50
 
