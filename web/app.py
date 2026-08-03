@@ -199,26 +199,31 @@ def api_chat():
 
 @app.route("/api/market-overview", methods=["GET"])
 def api_market_overview():
+    """首屏只等待指数行情；涨跌家数使用缓存并由独立接口渐进刷新。"""
     try:
-        # 指数行情和涨跌家数来自不同上游，并行获取以缩短首屏等待。
-        from concurrent.futures import ThreadPoolExecutor
         index_codes = ["sh000001", "sz399001", "sz399006"]
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            quote_future = executor.submit(_tencent_request, index_codes)
-            breadth_future = executor.submit(_quote.get_market_breadth)
-            data = quote_future.result()
-            breadth = breadth_future.result()
-
+        data = _tencent_request(index_codes)
+        breadth = _quote.get_cached_market_breadth()
         indices = [_parse_index(data[code]) for code in index_codes if code in data]
-        stats = {
-            "up": breadth.get("up"),
-            "down": breadth.get("down"),
-            "flat": breadth.get("flat"),
-            "limit_up": None,
-            "limit_down": None,
-        }
+        return jsonify({
+            "indices": indices,
+            "stats": {
+                "up": breadth.get("up"),
+                "down": breadth.get("down"),
+                "flat": breadth.get("flat"),
+                "limit_up": None,
+                "limit_down": None,
+            },
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
-        return jsonify({"indices": indices, "stats": stats})
+
+@app.route("/api/market-breadth", methods=["GET"])
+def api_market_breadth():
+    """独立加载涨跌家数，避免慢上游阻塞指数和整个首屏。"""
+    try:
+        return jsonify({"stats": _quote.get_market_breadth()})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 

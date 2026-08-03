@@ -4,7 +4,6 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>DataBoard</title>
-    <script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         :root {
@@ -739,16 +738,32 @@
                         <div class="change ${idx.change_pct >= 0 ? 'up' : 'down'}">${idx.change_pct >= 0 ? '+' : ''}${idx.change_pct.toFixed(2)}%</div>
                     </div>
                 `).join("");
-                const stats = data.stats;
-                const fmt = v => (v === null || v === undefined) ? "—" : v;
-                document.getElementById("statsRow").innerHTML = `
-                    <div class="stat-item"><div class="label">上涨</div><div class="value up">${fmt(stats.up)}</div></div>
-                    <div class="stat-item"><div class="label">下跌</div><div class="value down">${fmt(stats.down)}</div></div>
-                    <div class="stat-item"><div class="label">平盘</div><div class="value">${fmt(stats.flat)}</div></div>
-                `;
+                renderMarketStats(data.stats || {});
+                // 指数先展示，涨跌家数由独立短请求渐进更新，不阻塞首屏。
+                loadMarketBreadth();
             } catch (e) {
                 setServiceStatus(false, e.message);
                 document.getElementById("indicesGrid").innerHTML = `<div style="color:var(--danger);padding:12px;">加载失败: ${escapeHtml(e.message)}</div>`;
+            }
+        }
+
+        function renderMarketStats(stats = {}) {
+            const fmt = value => (value === null || value === undefined) ? "—" : value;
+            document.getElementById("statsRow").innerHTML = `
+                <div class="stat-item"><div class="label">上涨</div><div class="value up">${fmt(stats.up)}</div></div>
+                <div class="stat-item"><div class="label">下跌</div><div class="value down">${fmt(stats.down)}</div></div>
+                <div class="stat-item"><div class="label">平盘</div><div class="value">${fmt(stats.flat)}</div></div>
+            `;
+        }
+
+        async function loadMarketBreadth() {
+            try {
+                const resp = await fetchWithTimeout("/api/market-breadth", {}, 8000);
+                const data = await resp.json();
+                if (!resp.ok || data.error) throw new Error(data.error || `HTTP ${resp.status}`);
+                renderMarketStats(data.stats || {});
+            } catch (error) {
+                console.warn('涨跌家数加载失败', error);
             }
         }
 
@@ -791,7 +806,7 @@
 
         async function loadAiBalance() {
             try {
-                const resp = await fetch("/api/ai-balance");
+                const resp = await fetchWithTimeout("/api/ai-balance", {}, 5000);
                 const data = await resp.json();
                 const el = document.getElementById("aiBalance");
                 if (data.balance) {
@@ -977,9 +992,21 @@
             return template.innerHTML;
         }
 
-        // marked 默认允许原始 HTML；统一净化后再交给所有现有 Markdown 渲染点。
-        const unsafeMarkedParse = marked.parse.bind(marked);
-        marked.parse = value => sanitizeHtml(unsafeMarkedParse(String(value == null ? "" : value)));
+        // 内置轻量 Markdown 渲染，避免启动时同步等待外部 CDN。
+        function renderMarkdown(value) {
+            return escapeHtml(String(value == null ? "" : value))
+                .replace(/^###\s+(.+)$/gm, "<h3>$1</h3>")
+                .replace(/^##\s+(.+)$/gm, "<h2>$1</h2>")
+                .replace(/^#\s+(.+)$/gm, "<h1>$1</h1>")
+                .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
+                .replace(/`([^`]+)`/g, "<code>$1</code>")
+                .replace(/^[-*]\s+(.+)$/gm, "<div>• $1</div>")
+                .replace(/\n/g, "<br>");
+        }
+
+        window.marked = {
+            parse: value => sanitizeHtml(renderMarkdown(value)),
+        };
 
         async function sendMessage() {
             if (isProcessing) return;
@@ -1755,7 +1782,7 @@
         document.addEventListener("DOMContentLoaded", () => {
             showTab(0);
             loadChatHistory();
-            loadAiBalance();
+            setTimeout(loadAiBalance, 1500);
             document.querySelector('.tab-bar')?.addEventListener('keydown', event => {
                 if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
                 const buttons = [...document.querySelectorAll('.tab-btn')];

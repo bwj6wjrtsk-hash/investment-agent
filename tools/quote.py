@@ -251,30 +251,36 @@ def get_klines_raw(symbol: str, days: int = 120):
 _EM_HEADERS = {"User-Agent": "Mozilla/5.0", "Referer": "https://quote.eastmoney.com/"}
 
 
-def get_market_breadth(ttl=BREADTH_TTL) -> dict:
-    """获取真实沪深A股涨跌家数；成功缓存60秒，失败短缓存15秒并合并并发请求。"""
-    def cached_result(now):
+def _read_market_breadth_cache():
+    with _LOCK:
         data = _BREADTH_CACHE["data"]
-        if data is not None and now - _BREADTH_CACHE["ts"] <= _BREADTH_CACHE["ttl"]:
-            return data
-        return None
+        if (data is not None and
+                time.time() - _BREADTH_CACHE["ts"] <= _BREADTH_CACHE["ttl"]):
+            return dict(data)
+    return None
+
+
+def get_cached_market_breadth() -> dict:
+    """只读取有效缓存，不访问网络；首屏可立即返回。"""
+    return _read_market_breadth_cache() or {"up": None, "down": None, "flat": None}
+
+
+def get_market_breadth(ttl=BREADTH_TTL) -> dict:
+    """获取真实涨跌家数；单次请求最多约 6 秒，失败短暂负缓存。"""
+    cached = _read_market_breadth_cache()
+    if cached is not None:
+        return cached
 
     def remember(data, cache_ttl):
         with _LOCK:
             _BREADTH_CACHE.update({"ts": time.time(), "ttl": cache_ttl, "data": data})
         return data
 
-    with _LOCK:
-        cached = cached_result(time.time())
+    # 同一时间只允许一个请求链访问上游，其余请求等待并复用结果。
+    with _BREADTH_FETCH_LOCK:
+        cached = _read_market_breadth_cache()
         if cached is not None:
             return cached
-
-    # 涨跌家数接口较慢；同一时间只允许一个请求链访问上游。
-    with _BREADTH_FETCH_LOCK:
-        with _LOCK:
-            cached = cached_result(time.time())
-            if cached is not None:
-                return cached
 
         unknown = {"up": None, "down": None, "flat": None}
         fs = "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048"
@@ -288,22 +294,21 @@ def get_market_breadth(ttl=BREADTH_TTL) -> dict:
             }
             if extra_filter:
                 params["filter"] = extra_filter
-            # 单次统计的重试共享连接，避免反复建立 Session。
-            with _session() as session:
-                for _ in range(3):
-                    try:
-                        response = session.get(base, params=params, timeout=6, headers=_EM_HEADERS)
-                        if response.status_code == 200:
-                            return response.json().get("data", {}).get("total", 0) or 0
-                    except Exception:
-                        time.sleep(0.3)
+            try:
+                with _session() as session:
+                    response = session.get(
+                        base, params=params, timeout=3, headers=_EM_HEADERS,
+                    )
+                if response.status_code == 200:
+                    return response.json().get("data", {}).get("total", 0) or 0
+            except Exception:
+                pass
             return None
 
         total = _count()
         if not total:
             return remember(unknown, BREADTH_FAILURE_TTL)
 
-        # 总数确定后，上涨和下跌统计互不依赖，可并行获取。
         from concurrent.futures import ThreadPoolExecutor
         with ThreadPoolExecutor(max_workers=2) as executor:
             up_future = executor.submit(_count, "(f3>0)")
@@ -311,7 +316,6 @@ def get_market_breadth(ttl=BREADTH_TTL) -> dict:
             up = up_future.result()
             down = down_future.result()
 
-        # 拿不到、filter被忽略或家数超出总数时，不展示编造数字。
         if up is None or down is None or up >= total or down >= total or (up + down) > total:
             return remember(unknown, BREADTH_FAILURE_TTL)
 

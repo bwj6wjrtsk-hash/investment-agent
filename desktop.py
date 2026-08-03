@@ -21,25 +21,25 @@ load_dotenv()
 
 
 def start_flask():
-    """Run Flask in background thread"""
+    """Run Flask first, then defer heavy preload and market monitoring."""
     from web.app import app, start_signal_monitor
-    start_signal_monitor()
 
-    # Preload heavy modules in background after Flask is serving
-    # This runs while user sees the UI, so first API call is instant
     def _preload():
         try:
-            # langchain_openai is the heaviest single import (~2.3s)
             import langchain_openai  # noqa: F401
-            # Then coordinator brings in langgraph + all tools
             from agents.coordinator import create_investment_agent, chat  # noqa: F401
-            # chromadb for knowledge base
             import chromadb  # noqa: F401
         except Exception:
             pass
 
-    threading.Thread(target=_preload, daemon=True).start()
+    def _start_later(delay, target):
+        timer = threading.Timer(delay, target)
+        timer.daemon = True
+        timer.start()
 
+    # 避免 Flask 监听前的重型导入和行情监控争抢 CPU/GIL/行情锁。
+    _start_later(20, _preload)
+    _start_later(15, start_signal_monitor)
     app.run(host="127.0.0.1", port=5000, debug=False, use_reloader=False)
 
 
@@ -69,14 +69,29 @@ if __name__ == "__main__":
     )
 
     def wait_and_load():
-        """Wait for Flask to be ready, then navigate"""
+        """等待 Flask 就绪；探测失败时保留状态页，绝不跳到白屏。"""
         import urllib.request
-        for _ in range(30):  # max 15 seconds
+        ready = False
+        last_error = "服务尚未启动"
+        for _ in range(60):  # 最多约 30 秒，每次探测都有 1 秒硬超时
             try:
-                urllib.request.urlopen("http://127.0.0.1:5000/")
-                break
-            except:
+                with urllib.request.urlopen("http://127.0.0.1:5000/", timeout=1) as response:
+                    if response.status == 200:
+                        ready = True
+                        break
+            except Exception as error:
+                last_error = str(error)
                 time.sleep(0.5)
-        window.load_url("http://127.0.0.1:5000")
+        if ready:
+            window.load_url("http://127.0.0.1:5000")
+        else:
+            message = repr(f"服务启动失败：{last_error}")
+            window.evaluate_js(
+                "document.querySelector('p').textContent=" + message + ";"
+                "document.querySelector('p').style.color='#d93025';"
+                "document.body.insertAdjacentHTML('beforeend',"
+                "'<button onclick=\"location.href=\\\'http://127.0.0.1:5000\\\'\" "
+                "style=\"padding:8px 16px;border:0;border-radius:5px;cursor:pointer\">重试</button>');"
+            )
 
     webview.start(wait_and_load)
