@@ -149,12 +149,38 @@ def _tencent_request(codes: list) -> dict:
     return _quote.get_quotes(codes)
 
 
-def _parse_index(fields):
-    """Parse index data from Tencent format"""
+def _parse_index(code, fields):
+    """Parse and verify an index quote from Tencent's ``~`` separated format."""
+    required_index = 32
+    if len(fields) <= required_index:
+        raise ValueError(f"{code} 行情字段不完整")
+
+    try:
+        price = float(fields[3])
+        prev_close = float(fields[4])
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{code} 行情价格无效") from exc
+    if price <= 0 or prev_close <= 0:
+        raise ValueError(f"{code} 行情价格无效")
+
+    # 使用现价和昨收确定性计算，避免上游涨跌字段缺失或口径漂移。
+    change_amt = price - prev_close
+    change_pct = change_amt / prev_close * 100
+    raw_time = str(fields[30] or "").strip()
+    try:
+        as_of = datetime.strptime(raw_time, "%Y%m%d%H%M%S").strftime("%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        as_of = raw_time
+
     return {
+        "code": code,
         "name": fields[1],
-        "price": float(fields[3]) if fields[3] else 0,
-        "change_pct": float(fields[32]) if fields[32] else 0,
+        "price": price,
+        "prev_close": prev_close,
+        "change_amt": change_amt,
+        "change_pct": change_pct,
+        "as_of": as_of,
+        "source": "腾讯行情",
     }
 
 
@@ -199,14 +225,22 @@ def api_chat():
 
 @app.route("/api/market-overview", methods=["GET"])
 def api_market_overview():
-    """首屏只等待指数行情；涨跌家数使用缓存并由独立接口渐进刷新。"""
+    """首屏只等待完整指数行情；涨跌家数由独立接口渐进刷新。"""
     try:
         index_codes = ["sh000001", "sz399001", "sz399006"]
         data = _tencent_request(index_codes)
+        missing = [code for code in index_codes if code not in data]
+        if missing:
+            return jsonify({
+                "error": "指数实时行情不完整，请稍后重试",
+                "missing_codes": missing,
+            }), 502
+
+        indices = [_parse_index(code, data[code]) for code in index_codes]
         breadth = _quote.get_cached_market_breadth()
-        indices = [_parse_index(data[code]) for code in index_codes if code in data]
         return jsonify({
             "indices": indices,
+            "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "stats": {
                 "up": breadth.get("up"),
                 "down": breadth.get("down"),
@@ -215,6 +249,8 @@ def api_market_overview():
                 "limit_down": None,
             },
         })
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 502
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -2479,6 +2515,64 @@ def api_add_position_calc():
         return jsonify({"result": result})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+# ===== 公司预期变化研究 API =====
+
+@app.route("/api/company-research/tasks", methods=["POST"])
+def api_company_research_create():
+    """创建后台研究任务，立即返回 task_id，避免阻塞其他写接口。"""
+    try:
+        data = request.get_json(silent=True) or {}
+        company = str(data.get("company", "")).strip()
+        symbol = str(data.get("symbol", "")).strip()
+        depth = str(data.get("search_depth", "basic")).strip()
+        if not company:
+            return jsonify({"error": "请输入公司名称或股票代码"}), 400
+        if symbol and (len(symbol) != 6 or not symbol.isdigit()):
+            return jsonify({"error": "股票代码必须是6位数字"}), 400
+        if depth not in {"basic", "deep"}:
+            return jsonify({"error": "检索深度必须是 basic 或 deep"}), 400
+        from research_system.web_jobs import start_job
+        job = start_job({
+            "company": company,
+            "symbol": symbol,
+            "search_depth": depth,
+        })
+        job.pop("result", None)
+        return jsonify(job), 202
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/api/company-research/tasks/<task_id>", methods=["GET"])
+def api_company_research_status(task_id):
+    from research_system.web_jobs import get_job
+    job = get_job(task_id)
+    if not job:
+        return jsonify({"error": "研究任务不存在或已过期"}), 404
+    return jsonify(job)
+
+
+@app.route("/api/company-research/analyses", methods=["GET"])
+def api_company_research_analyses():
+    try:
+        limit = min(max(int(request.args.get("limit", 10)), 1), 50)
+        from research_system.repository import ResearchRepository
+        return jsonify({"analyses": ResearchRepository().list_analyses(limit)})
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/api/company-research/analyses/<analysis_id>", methods=["GET"])
+def api_company_research_analysis(analysis_id):
+    from research_system.repository import ResearchRepository
+    result = ResearchRepository().get_analysis(analysis_id)
+    if not result:
+        return jsonify({"error": "研究记录不存在"}), 404
+    stages = result.pop("stages", {})
+    result.update(stages)
+    return jsonify(result)
 
 
 _signal_monitor_lock = threading.Lock()

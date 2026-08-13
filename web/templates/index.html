@@ -702,6 +702,9 @@
             });
             if (!loadedTabs.has(index) && loadTabData(index)) {
                 loadedTabs.add(index);
+            } else if (index === 0) {
+                // 切回总览时立即拉取最新指数；在途请求由 runLoader 自动复用。
+                runLoader(window.loadMarketOverview, 'loadMarketOverview');
             } else if (index === 2) {
                 // 自选行情切回页面时立即刷新；若已有请求在途则直接复用。
                 runLoader(window.loadWatchlist, 'loadWatchlist');
@@ -729,15 +732,38 @@
                 const resp = await fetchWithTimeout("/api/market-overview");
                 const data = await resp.json();
                 if (!resp.ok || data.error) throw new Error(data.error || `HTTP ${resp.status}`);
-                setServiceStatus(true);
+                if (!Array.isArray(data.indices) || data.indices.length !== 3) {
+                    throw new Error('指数实时行情不完整');
+                }
+
+                const normalized = data.indices.map(idx => {
+                    const price = Number(idx.price);
+                    const changeAmt = Number(idx.change_amt);
+                    const changePct = Number(idx.change_pct);
+                    if (![price, changeAmt, changePct].every(Number.isFinite) || price <= 0) {
+                        throw new Error(`${idx.name || idx.code || '指数'}行情数据无效`);
+                    }
+                    return {...idx, price, change_amt: changeAmt, change_pct: changePct};
+                });
+                const latestAsOf = normalized.map(idx => String(idx.as_of || '')).sort().at(-1) || '';
+                const pollTime = String(data.generated_at || latestAsOf).replace('T', ' ').slice(5, 19) || '时间未知';
+                setServiceStatus(true, latestAsOf ? `本次批量获取完成；最新源行情 ${latestAsOf}` : '指数行情已批量更新');
+
                 const grid = document.getElementById("indicesGrid");
-                grid.innerHTML = data.indices.map(idx => `
-                    <div class="index-card">
-                        <div class="name">${escapeHtml(idx.name || '')}</div>
-                        <div class="price ${idx.change_pct >= 0 ? 'up' : 'down'}">${idx.price.toFixed(2)}</div>
-                        <div class="change ${idx.change_pct >= 0 ? 'up' : 'down'}">${idx.change_pct >= 0 ? '+' : ''}${idx.change_pct.toFixed(2)}%</div>
-                    </div>
-                `).join("");
+                grid.innerHTML = normalized.map(idx => {
+                    const direction = idx.change_pct >= 0 ? 'up' : 'down';
+                    const pctSign = idx.change_pct > 0 ? '+' : '';
+                    const amountSign = idx.change_amt > 0 ? '+' : '';
+                    const sourceTime = String(idx.as_of || '').replace('T', ' ').slice(5, 19) || '时间未知';
+                    return `
+                        <div class="index-card">
+                            <div class="name">${escapeHtml(idx.name || '')}</div>
+                            <div class="price ${direction}">${idx.price.toFixed(2)}</div>
+                            <div class="change ${direction}">${amountSign}${idx.change_amt.toFixed(2)}（${pctSign}${idx.change_pct.toFixed(2)}%）</div>
+                            <div style="font-size:10px;color:var(--text-secondary);margin-top:4px" title="${escapeHtml(`${idx.source || ''}源行情时间 ${sourceTime}`)}">统一获取 ${escapeHtml(pollTime)}</div>
+                        </div>
+                    `;
+                }).join("");
                 renderMarketStats(data.stats || {});
                 // 指数先展示，涨跌家数由独立短请求渐进更新，不阻塞首屏。
                 loadMarketBreadth();
@@ -1796,16 +1822,18 @@
                 showTab(next);
                 buttons[next]?.focus();
             });
-            scheduleVisibleRefresh(loadMarketOverview, 3 * 60 * 1000, [0]);
+            // 与后端15秒行情缓存对齐；仅在总览可见时刷新。
+            scheduleVisibleRefresh(loadMarketOverview, 15 * 1000, [0]);
             scheduleVisibleRefresh(loadSectorFlow, 5 * 60 * 1000, [0]);
             scheduleVisibleRefresh(loadPortfolio, 90 * 1000, [0, 1]);
             scheduleVisibleRefresh(loadProfitSummary, 90 * 1000, [0, 1]);
             scheduleVisibleRefresh(loadSignals, 5 * 60 * 1000, [2]);
-            // 与后端15秒行情缓存对齐，避免自选涨跌幅长期滞后。
             scheduleVisibleRefresh(loadWatchlist, 15 * 1000, [2]);
             document.addEventListener('visibilitychange', () => {
-                const watchTab = document.getElementById('tab-2');
-                if (!document.hidden && loadedTabs.has(2) && watchTab?.classList.contains('active')) {
+                if (document.hidden) return;
+                if (activeTab === 0 && loadedTabs.has(0)) {
+                    runLoader(window.loadMarketOverview, 'loadMarketOverview');
+                } else if (activeTab === 2 && loadedTabs.has(2)) {
                     runLoader(window.loadWatchlist, 'loadWatchlist');
                 }
             });
@@ -2360,6 +2388,822 @@
             loadEvents(); loadAlerts();
         };
         function loadInsights(){ return Promise.all([loadAlerts(),loadEvents()]); }
+
+        let companyResearchTaskId = null;
+        let companyResearchPollTimer = null;
+        let companyResearchLoadedLatest = false;
+
+        function researchList(items) {
+            const values = Array.isArray(items) ? items : [];
+            return values.length
+                ? `<ul style="margin:6px 0 0 18px;line-height:1.7">${values.map(x => `<li>${escapeHtml(typeof x === 'string' ? x : JSON.stringify(x))}</li>`).join('')}</ul>`
+                : '<div style="color:var(--text-secondary);font-size:12px">暂无可靠数据</div>';
+        }
+
+        function renderGateBadge(gate) {
+            if (!gate || gate.reason === '尚未执行证据门控') return '';
+            const passed = Boolean(gate.passed);
+            return `<span style="display:inline-block;padding:2px 7px;border-radius:10px;background:${passed ? '#e6f4ea' : '#fce8e6'};color:${passed ? '#188038' : '#d93025'};font-size:9px;font-weight:700" title="${escapeHtml(gate.reason || '')}">${passed ? 'Evidence Gate通过' : 'Evidence Gate未通过'}</span>`;
+        }
+
+        function renderStoryTree(items, evidenceItems) {
+            const values = Array.isArray(items) ? items : [];
+            if (!values.length) return '<div style="color:var(--text-secondary);font-size:12px">暂无故事树数据</div>';
+            const typeMeta = {
+                old: {label:'旧故事', color:'#5f6368', bg:'#f1f3f4'},
+                current: {label:'当前故事', color:'#1a73e8', bg:'#e8f0fe'},
+                potential: {label:'潜在新故事', color:'#b06000', bg:'#fef7e0'},
+                extreme_bull: {label:'极端乐观故事', color:'#8430ce', bg:'#f3e8fd'}
+            };
+            const names = new Map(values.map(item => [item.node_id, item.name]));
+            const text = value => escapeHtml(value || '证据不足');
+            return values.map((story, index) => {
+                const meta = typeMeta[story.story_type] || {label:'其他故事', color:'#5f6368', bg:'#f1f3f4'};
+                const probability = Math.max(0, Math.min(1, Number(story.probability) || 0));
+                const conditional = Math.max(0, Math.min(1, Number(story.conditional_probability ?? story.probability) || 0));
+                const conditions = Array.isArray(story.conditions) ? story.conditions : [];
+                const dependencies = (story.depends_on || []).map(id => `${id} ${names.get(id) || ''}`).join('、') || '根节点';
+                const overlaps = (story.overlaps_with || []).map(id => `${id} ${names.get(id) || ''}`).join('、');
+                const path = [
+                    ['需求', story.demand], ['产品', story.product], ['客户', story.customers],
+                    ['收入', story.revenue_path], ['利润', story.profit_path]
+                ];
+                return `<section style="border:1px solid var(--border);border-left:5px solid ${meta.color};border-radius:10px;padding:14px;margin-top:12px;background:white">
+                    <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px">
+                        <div><span style="padding:2px 7px;border-radius:10px;background:#202124;color:white;font-size:9px">${escapeHtml(story.node_id || `S${index + 1}`)}</span><span style="display:inline-block;padding:2px 8px;border-radius:12px;background:${meta.bg};color:${meta.color};font-size:10px;font-weight:700;margin-left:5px">${meta.label}</span><b style="margin-left:8px;font-size:15px">${text(story.name)}</b><span style="margin-left:7px">${renderGateBadge(story.evidence_gate)}</span></div>
+                        <div style="min-width:118px;text-align:right"><b style="color:${meta.color}">${formatRate(probability)}</b><div style="height:5px;background:#e8eaed;border-radius:4px;margin-top:4px;overflow:hidden"><div style="height:100%;width:${probability * 100}%;background:${meta.color}"></div></div><span style="font-size:9px;color:var(--text-secondary)">祖先闭包联合概率</span></div>
+                    </div>
+                    <div style="font-size:10px;color:var(--text-secondary);margin-top:6px">依赖：${escapeHtml(dependencies)}${overlaps ? `　重复/嵌套：${escapeHtml(overlaps)}` : ''}</div>
+                    <div style="margin-top:9px;padding:10px 12px;background:${meta.bg};border-radius:7px;line-height:1.7"><b>核心逻辑：</b>${text(story.thesis)}${story.causal_link ? `<div style="font-size:10px;margin-top:4px"><b>因果连接：</b>${text(story.causal_link)}</div>` : ''}</div>
+                    ${conditions.length ? `<div style="margin-top:10px"><b style="font-size:11px">条件概率（本节点 ${formatRate(conditional)}）</b><div style="display:grid;grid-template-columns:repeat(${Math.min(conditions.length, 4)},1fr);gap:6px;margin-top:5px">${conditions.map(condition => `<div style="padding:8px;border:1px solid #e8eaed;border-radius:6px;background:#f8f9fa"><div style="display:flex;justify-content:space-between;gap:5px"><b style="font-size:10px">${text(condition.description)}</b><b style="color:${meta.color}">${formatRate(condition.probability)}</b></div><div style="font-size:9px;color:var(--text-secondary);margin-top:4px">${text(condition.rationale)}</div>${renderCompactEvidence(condition.evidence_refs, evidenceItems)}</div>`).join('')}</div></div>` : ''}
+                    <div style="display:grid;grid-template-columns:repeat(4,minmax(130px,1fr));gap:8px;margin-top:10px">
+                        <div style="padding:8px;background:#f8f9fa;border-radius:6px"><b style="font-size:11px">为什么是现在</b><div style="font-size:11px;margin-top:3px">${text(story.why_now)}</div></div>
+                        <div style="padding:8px;background:#f8f9fa;border-radius:6px"><b style="font-size:11px">当前进展</b><div style="font-size:11px;margin-top:3px">${text(story.current_progress)}</div></div>
+                        <div style="padding:8px;background:#f8f9fa;border-radius:6px"><b style="font-size:11px">关键不确定性</b><div style="font-size:11px;margin-top:3px">${text(story.critical_uncertainty)}</div></div>
+                        <div style="padding:8px;background:#f8f9fa;border-radius:6px"><b style="font-size:11px">时间窗口</b><div style="font-size:11px;margin-top:3px">${text(story.time_horizon)}</div></div>
+                    </div>
+                    <div style="font-size:11px;font-weight:700;color:var(--text-secondary);margin-top:12px">商业兑现链路</div>
+                    <div style="display:grid;grid-template-columns:repeat(5,minmax(130px,1fr));gap:7px;margin-top:6px;overflow-x:auto">${path.map((step, stepIndex) => `<div style="padding:9px;background:#f8f9fa;border:1px solid #e8eaed;border-radius:7px;min-height:72px"><div style="font-size:10px;color:${meta.color};font-weight:700">${stepIndex + 1}. ${step[0]}</div><div style="font-size:11px;line-height:1.55;margin-top:3px">${text(step[1])}</div></div>`).join('')}</div>
+                    <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-top:12px">
+                        <div style="padding:9px;border-radius:7px;background:#e6f4ea"><b style="font-size:11px;color:#188038">支持证据</b>${renderCompactEvidence(story.evidence_for, evidenceItems)}</div>
+                        <div style="padding:9px;border-radius:7px;background:#fce8e6"><b style="font-size:11px;color:#d93025">反对证据</b>${renderCompactEvidence(story.evidence_against, evidenceItems)}</div>
+                        <div style="padding:9px;border-radius:7px;background:#e8f0fe"><b style="font-size:11px;color:#1a73e8">下一步验证</b>${researchList(story.next_evidence)}</div>
+                    </div>
+                </section>`;
+            }).join('');
+        }
+
+        function formatResearchNumber(value, suffix = '') {
+            if (value === null || value === undefined || value === '') return '-';
+            const number = Number(value);
+            if (!Number.isFinite(number)) return escapeHtml(value);
+            return `${new Intl.NumberFormat('zh-CN', {maximumFractionDigits: 2}).format(number)}${suffix}`;
+        }
+
+        function formatRate(value) {
+            if (value === null || value === undefined || value === '') return '-';
+            const number = Number(value);
+            if (!Number.isFinite(number)) return escapeHtml(value);
+            return `${new Intl.NumberFormat('zh-CN', {maximumFractionDigits: 2}).format(number * 100)}%`;
+        }
+
+        function formatProbability(value) {
+            if (value === null || value === undefined || value === '') return '-';
+            const number = Number(value);
+            if (!Number.isFinite(number)) return escapeHtml(value);
+            return `${Math.round(number * 100)}%`;
+        }
+
+        function renderInvestmentVerdict(verdict) {
+            const item = verdict || {};
+            const colors = {blocked:'#d93025',insufficient_return:'#b06000',mixed:'#1a73e8',favorable:'#188038'};
+            const color = colors[item.status] || '#5f6368';
+            const layers = [
+                ['失败层级', item.failed_layer || (item.status === 'blocked' ? '未识别' : '全部通过')],
+                ['① 估值为何Blocked', item.valuation_block_reason || '未阻断'],
+                ['② 当前价格要求', item.current_price_required_earnings || 'Model-Implied Earnings不可用'],
+                ['③ Base能否满足', item.base_forecast_assessment || '不可用'],
+                ['③ Bull能否满足', item.bull_forecast_assessment || '不可用'],
+                ['④ 最关键财务变量', item.key_financial_driver || '无法识别'],
+            ];
+            return `<div class="card" style="border-left:6px solid ${color};background:#fff"><div style="display:flex;justify-content:space-between;gap:10px;align-items:center"><div><div style="font-size:10px;color:var(--text-secondary)">Investment Verdict · Program Derived</div><b style="font-size:19px;color:${color}">${escapeHtml(item.label || item.status || '审计未执行')}</b></div><div style="text-align:right;font-size:10px">年化回报 ${formatRate(item.annualized_expected_return)}<br>要求回报 ${formatRate(item.required_annual_return)}<br>负回报概率 ${formatProbability(item.probability_of_negative_return)}</div></div><div style="margin-top:8px;line-height:1.7">${escapeHtml(item.summary || '尚未生成程序化判断')}</div><div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:7px;margin-top:9px">${layers.map(([label,value]) => `<div style="padding:8px;background:#f8f9fa;border-radius:6px;font-size:10px"><b>${escapeHtml(label)}</b><div style="margin-top:3px">${escapeHtml(value)}</div></div>`).join('')}</div>${(item.evidence_needed || []).length ? `<div style="margin-top:8px;color:#b06000"><b>⑤ 解除Blocked所需证据</b>${researchList(item.evidence_needed)}</div>` : ''}<div style="font-size:10px;color:var(--text-secondary);margin-top:6px">${escapeHtml(item.price_reflection_conclusion || '')}</div>${(item.derivation || []).length ? `<details style="margin-top:7px"><summary style="cursor:pointer;font-weight:700">量化推导链</summary>${researchList(item.derivation)}</details>` : ''}${(item.blockers || []).length ? `<div style="margin-top:7px;color:var(--danger)"><b>阻断项</b>${researchList(item.blockers)}</div>` : ''}</div>`;
+        }
+
+        function renderProbabilityAudit(audit) {
+            const item = audit || {};
+            const entries = Array.isArray(item.entries) ? item.entries : [];
+            if (!entries.length) return '<div style="color:var(--text-secondary)">历史结果没有 Probability Audit Trail。</div>';
+            const rows = entries.map(row => `<tr><td><b>${escapeHtml(row.scenario)}</b></td><td>${escapeHtml(row.event_definition || '-')}<div style="font-size:9px;color:var(--text-secondary)">${escapeHtml((row.boundary_conditions || []).join('；'))}</div></td><td>${escapeHtml(row.horizon || '-')}</td><td>${formatProbability(row.base_probability)}</td><td>${formatResearchNumber(row.evidence_factor,'×')}</td><td>${formatResearchNumber(row.raw_adjusted_probability)}</td><td>${formatResearchNumber(row.normalization_denominator)}</td><td><b>${formatProbability(row.normalized_probability)}</b></td><td style="font-size:9px">${escapeHtml(row.formula || '-')}</td></tr>`).join('');
+            return `<div style="padding:8px;background:${item.passed ? '#e6f4ea' : '#fce8e6'};border-radius:6px;margin-bottom:8px;font-size:10px"><b>${item.passed ? 'PASS' : 'BLOCKED'}</b> · 互斥 ${item.mutually_exclusive ? 'Yes' : 'No'} · 穷尽 ${item.exhaustive ? 'Yes' : 'No'} · ΣBase=${formatProbability(item.base_probability_sum)} · ΣFinal=${formatProbability(item.probability_sum)}</div><div style="overflow-x:auto"><table style="width:100%;min-width:1200px;border-collapse:collapse;font-size:9px"><thead><tr style="background:#f1f3f4"><th>Scenario</th><th>事件定义 / 边界</th><th>Horizon</th><th>Base P</th><th>Evidence Factor</th><th>Raw Adjusted</th><th>Normalization</th><th>Final P</th><th>Formula</th></tr></thead><tbody>${rows}</tbody></table></div>${(item.issues || []).length ? `<div style="color:var(--danger);margin-top:7px">${researchList(item.issues)}</div>` : ''}`;
+        }
+
+        function renderPreValuationProbabilityAudit(audit, evidenceItems) {
+            const item = audit || {};
+            const scenarios = Array.isArray(item.scenarios) ? item.scenarios : [];
+            const rows = scenarios.map(row => `<tr><td><b>${escapeHtml(row.name)}</b></td><td>${formatProbability(row.base_probability)}</td><td>${escapeHtml(row.event_definition || '-')}<div style="font-size:8px;color:var(--text-secondary)">${escapeHtml((row.boundary_conditions || []).join('；'))}</div></td><td>${escapeHtml(row.horizon || '-')}</td><td>${escapeHtml(row.reasoning || '-')}</td><td>${item.evidence_coverage?.[row.name] ? 'Valid A/B' : 'Missing / Invalid'}${renderCompactEvidence(row.evidence_refs, evidenceItems)}</td></tr>`).join('');
+            return `<div style="padding:8px;background:${item.passed ? '#e6f4ea' : '#fce8e6'};border-radius:6px;font-size:10px"><b>${item.passed ? 'PRE-VALUATION PROBABILITY PASS' : 'PRE-VALUATION PROBABILITY BLOCKED'}</b> · Exact Bear/Base/Bull ${item.exact_scenarios ? 'Yes' : 'No'} · ΣBase ${formatProbability(item.probability_sum)} · Mutual ${item.mutually_exclusive ? 'Yes' : 'No'} · Exhaustive ${item.exhaustive ? 'Yes' : 'No'} · Common Horizon ${item.common_horizon ? 'Yes' : 'No'}<div style="margin-top:4px"><b>State Variable:</b> ${escapeHtml(item.common_state_variable || '-')}</div><div style="margin-top:3px"><b>Mutual:</b> ${escapeHtml(item.mutually_exclusive_reasoning || '-')}<br><b>Exhaustive:</b> ${escapeHtml(item.exhaustive_reasoning || '-')}</div></div>${rows ? `<div style="overflow-x:auto;margin-top:7px"><table style="width:100%;min-width:1250px;border-collapse:collapse;font-size:9px"><thead><tr style="background:#f1f3f4"><th>Scenario</th><th>Base P</th><th>Event / Boundaries</th><th>Horizon</th><th>Reasoning</th><th>Evidence</th></tr></thead><tbody>${rows}</tbody></table></div>` : '<div style="color:var(--text-secondary);margin-top:6px">历史结果没有独立Probability Agent输出。</div>'}${(item.issues || []).length ? `<div style="color:var(--danger);margin-top:7px">${researchList(item.issues)}</div>` : ''}`;
+        }
+
+        function renderComparableEvidenceAudit(audit, evidenceItems) {
+            const item = audit || {};
+            const rows = Array.isArray(item.evidence_items) ? item.evidence_items : [];
+            const body = rows.map(row => `<tr><td><b>${escapeHtml(row.method)}</b></td><td>${escapeHtml(row.relationship)}</td><td>${escapeHtml(row.subject || row.symbol || '-')}</td><td>${formatResearchNumber(row.value,'×')}<div>${formatResearchNumber(row.range_low,'×')} ~ ${formatResearchNumber(row.range_high,'×')}</div></td><td>${escapeHtml(row.as_of || '-')}</td><td>${escapeHtml(row.period || '-')}</td><td>${escapeHtml(row.accounting_basis || '-')}</td><td>${escapeHtml(row.applicability || '-')}</td><td style="color:${row.valid ? '#188038' : '#d93025'}">${row.valid ? 'VALID' : 'INVALID'}<div>${escapeHtml(row.reason || '')}</div>${renderCompactEvidence([row.evidence_ref], evidenceItems)}</td></tr>`).join('');
+            const selected = Object.entries(item.selected_methods || {}).map(([name, method]) => `${name}: ${method}`).join(' · ') || '-';
+            return `<div style="padding:8px;background:${item.passed ? '#e6f4ea' : '#fce8e6'};border-radius:6px;font-size:10px"><b>${item.passed ? 'COMPARABLE EVIDENCE PASS' : 'COMPARABLE EVIDENCE BLOCKED'}</b> · Selected terminal methods supported ${item.selected_methods_supported ? 'Yes' : 'No'}<div style="margin-top:3px"><b>Selected:</b> ${escapeHtml(selected)}</div></div>${body ? `<div style="overflow-x:auto;margin-top:7px"><table style="width:100%;min-width:1500px;border-collapse:collapse;font-size:9px"><thead><tr style="background:#f1f3f4"><th>Method</th><th>Relationship</th><th>Subject</th><th>Value / Range</th><th>As Of</th><th>Period</th><th>Accounting Basis</th><th>Applicability</th><th>Validation / Evidence</th></tr></thead><tbody>${body}</tbody></table></div>` : '<div style="color:var(--text-secondary);margin-top:6px">没有通过结构化校验的同行或公司历史倍数证据。</div>'}${(item.evidence_needed || []).length ? `<div style="color:#b06000;margin-top:7px"><b>Evidence Needed</b>${researchList(item.evidence_needed)}</div>` : ''}${(item.issues || []).length ? `<div style="color:var(--danger);margin-top:7px">${researchList(item.issues)}</div>` : ''}`;
+        }
+
+        function renderForecastReasonablenessAudit(audit, evidenceItems) {
+            const item = audit || {};
+            const anchors = Array.isArray(item.historical_anchors) ? item.historical_anchors : [];
+            const forecasts = Array.isArray(item.forecast_entries) ? item.forecast_entries : [];
+            const bridges = Array.isArray(item.margin_bridges) ? item.margin_bridges : [];
+            const marginExpansion = item.margin_expansion_evidence || {};
+            const marginExpansionRows = Array.isArray(marginExpansion.items) ? marginExpansion.items : [];
+            const separation = item.scenario_separation || {};
+            const anchorRows = anchors.map(row => `<tr><td><b>${escapeHtml(row.label)}</b></td><td>${escapeHtml((row.periods || []).join(', ') || '-')}</td><td>${formatRate(row.historical_min)}</td><td>${formatRate(row.historical_median)}</td><td>${formatRate(row.historical_max)}</td><td>${row.available ? 'Available' : 'Missing'}<div style="font-size:8px;color:var(--text-secondary)">${escapeHtml(row.basis || row.issue || '')}</div>${renderCompactEvidence(row.evidence_refs, evidenceItems)}</td></tr>`).join('');
+            const forecastRows = forecasts.map(row => { const colors={within_history:'#188038',supported_structural_change:'#1a73e8',unsupported_forecast:'#d93025'}; return `<tr><td><b>${escapeHtml(row.scenario)}</b></td><td>${escapeHtml(row.year)}</td><td>${escapeHtml(row.label)}</td><td>${formatRate(row.forecast_value)}</td><td>${formatRate(row.historical_min)} ~ ${formatRate(row.historical_max)}</td><td>${formatRate(row.reasonableness_lower)} ~ ${formatRate(row.reasonableness_upper)}</td><td style="color:${colors[row.status] || '#5f6368'};font-weight:700">${escapeHtml(row.status)}</td><td>${escapeHtml(row.reason || '-')} ${renderCompactEvidence(row.valid_evidence_refs, evidenceItems)}</td></tr>`; }).join('');
+            const bridgeRows = bridges.map(row => `<tr><td><b>${escapeHtml(row.scenario)}</b></td><td>${escapeHtml(row.year)}</td><td>${formatResearchNumber(row.revenue)}</td><td>${formatResearchNumber(row.gross_profit)}<div>${formatRate(row.gross_margin)}</div></td><td>${formatResearchNumber(row.ebit)}<div>${formatRate(row.ebit_margin)}</div></td><td>${formatResearchNumber(row.depreciation_amortization)}<div>${formatRate(row.depreciation_amortization_ratio)}</div></td><td>${formatResearchNumber(row.ebitda)}<div>${formatRate(row.ebitda_margin)}</div></td><td>${formatResearchNumber(row.ebt)}</td><td>${formatResearchNumber(row.net_profit)}<div>${formatRate(row.net_margin)}</div></td><td>${row.formula_passed && !(row.issues || []).length ? 'PASS' : 'BLOCKED'}<div style="font-size:8px;color:var(--text-secondary)">${escapeHtml(row.explanation || '')}</div>${(row.issues || []).length ? researchList(row.issues) : ''}</td></tr>`).join('');
+            const marginExpansionBody = marginExpansionRows.map(row => `<tr><td>${escapeHtml(row.year)}</td><td>${formatRate(row.base_gross_margin)}</td><td>${formatRate(row.bull_gross_margin)}</td><td><b>${formatRate(row.gross_margin_delta)}</b></td><td>${row.material ? 'Material' : 'Not material'} / ${row.primary_profit_driver ? 'Primary' : 'Secondary'}</td><td>${(row.drivers || []).map(driver => `${escapeHtml(driver.factor_type)}: ${escapeHtml(driver.description)} (${formatRate(driver.gross_margin_impact)})`).join('<br>') || '-'}</td><td>${formatRate(row.driver_impact_sum)}</td><td>${formatResearchNumber(row.gross_profit_impact)} → ${formatResearchNumber(row.ebit_impact)} → ${formatResearchNumber(row.net_profit_impact)}</td><td style="color:${row.supported ? '#188038' : '#d93025'}"><b>${row.supported ? 'SUPPORTED' : 'BLOCKED'}</b><div>${escapeHtml(row.causal_chain || '')}</div>${renderCompactEvidence(row.valid_evidence_refs, evidenceItems)}${(row.issues || []).length ? researchList(row.issues) : ''}</td></tr>`).join('');
+            const driverRows = (separation.drivers || []).map(row => `<tr><td>${escapeHtml(row.year)}</td><td><b>${escapeHtml(row.label)}</b></td><td>${formatRate(row.bear_value)}</td><td>${formatRate(row.base_value)}</td><td>${formatRate(row.bull_value)}</td><td>${formatRate(row.bull_vs_base)}</td><td>${formatResearchNumber(row.estimated_bull_vs_base_profit_impact)}</td><td>${row.supported ? 'Supported' : 'Unsupported'}${renderCompactEvidence(row.evidence_refs, evidenceItems)}</td></tr>`).join('');
+            return `<div style="padding:8px;background:${item.passed ? '#e6f4ea' : '#fce8e6'};border-radius:6px;font-size:10px"><b>${item.passed ? 'FORECAST REASONABLENESS PASS' : 'FORECAST REASONABLENESS BLOCKED'}</b> · Historical Anchor ${item.historical_anchor_passed ? 'PASS' : 'FAIL'} · Margin Bridge ${item.margin_bridge_passed ? 'PASS' : 'FAIL'} · Margin Expansion Evidence ${item.margin_expansion_evidence_passed ? 'PASS' : 'FAIL'} · Scenario Separation ${item.scenario_separation_passed ? 'PASS' : 'FAIL'} · Valuation Allowed ${item.valuation_allowed ? 'Yes' : 'No'}<div style="margin-top:4px"><b>Key Driver:</b> ${escapeHtml(item.key_driver || '无法识别')}</div></div>
+                <details open style="margin-top:8px"><summary style="cursor:pointer;font-weight:700">Historical Anchor Audit</summary><div style="overflow-x:auto;margin-top:6px"><table style="width:100%;min-width:900px;border-collapse:collapse;font-size:9px"><thead><tr style="background:#f1f3f4"><th>Variable</th><th>Periods</th><th>Min</th><th>Median</th><th>Max</th><th>Basis / Evidence</th></tr></thead><tbody>${anchorRows}</tbody></table></div></details>
+                <details style="margin-top:8px"><summary style="cursor:pointer;font-weight:700">Forecast vs Historical Range</summary><div style="overflow-x:auto;margin-top:6px"><table style="width:100%;min-width:1350px;border-collapse:collapse;font-size:9px"><thead><tr style="background:#f1f3f4"><th>Scenario</th><th>Year</th><th>Variable</th><th>Forecast</th><th>Historical Range</th><th>Reasonableness Band</th><th>Status</th><th>Reason / Evidence</th></tr></thead><tbody>${forecastRows}</tbody></table></div></details>
+                <details style="margin-top:8px"><summary style="cursor:pointer;font-weight:700">Margin Bridge Audit · Revenue→Gross Profit→EBIT→EBITDA→EBT→Net Profit</summary><div style="overflow-x:auto;margin-top:6px"><table style="width:100%;min-width:1450px;border-collapse:collapse;font-size:9px"><thead><tr style="background:#f1f3f4"><th>Scenario</th><th>Year</th><th>Revenue</th><th>Gross Profit / Margin</th><th>EBIT / Margin</th><th>D&A / Revenue</th><th>EBITDA / Margin</th><th>EBT</th><th>Net Profit / Margin</th><th>Audit</th></tr></thead><tbody>${bridgeRows}</tbody></table></div></details>
+                <details open style="margin-top:8px"><summary style="cursor:pointer;font-weight:700">Margin Expansion Evidence Audit · Driver→Gross Margin→EBIT→Net Profit→Valuation</summary><div style="font-size:10px;margin-top:5px"><b>Status:</b> ${marginExpansion.passed ? 'PASS' : 'BLOCKED'} · <b>Gross Margin Primary Driver:</b> ${marginExpansion.gross_margin_is_primary_driver ? 'Yes' : 'No'} · <b>Bull Profit Improvement:</b> ${formatResearchNumber(marginExpansion.bull_profit_improvement)}</div><div style="overflow-x:auto;margin-top:6px"><table style="width:100%;min-width:1550px;border-collapse:collapse;font-size:9px"><thead><tr style="background:#f1f3f4"><th>Year</th><th>Base GM</th><th>Bull GM</th><th>Δ GM</th><th>Materiality</th><th>Business Drivers</th><th>Driver Σ</th><th>Gross Profit→EBIT→Net Profit</th><th>Audit / Evidence</th></tr></thead><tbody>${marginExpansionBody}</tbody></table></div>${(marginExpansion.evidence_needed || []).length ? `<div style="color:#b06000">${researchList(marginExpansion.evidence_needed)}</div>` : ''}</details>
+                <details style="margin-top:8px"><summary style="cursor:pointer;font-weight:700">Scenario Separation Audit</summary><div style="font-size:10px;margin-top:5px"><b>Bull vs Base Profit Improvement:</b> ${formatResearchNumber(separation.bull_vs_base_profit_improvement)} · <b>Key Driver:</b> ${escapeHtml(separation.key_driver || '-')}</div><div style="overflow-x:auto;margin-top:6px"><table style="width:100%;min-width:1050px;border-collapse:collapse;font-size:9px"><thead><tr style="background:#f1f3f4"><th>Year</th><th>Variable</th><th>Bear</th><th>Base</th><th>Bull</th><th>Bull-Base</th><th>Estimated Profit Impact</th><th>Evidence</th></tr></thead><tbody>${driverRows}</tbody></table></div></details>
+                ${(item.evidence_needed || []).length ? `<div style="color:#b06000;margin-top:8px"><b>解除Forecast Gate所需证据</b>${researchList(item.evidence_needed)}</div>` : ''}${(item.issues || []).length ? `<div style="color:var(--danger);margin-top:8px"><b>Forecast Blockers</b>${researchList(item.issues)}</div>` : ''}`;
+        }
+
+        function renderValuationAudit(audit) {
+            const item = audit || {};
+            const rows = Array.isArray(item.scenario_rows) ? item.scenario_rows : [];
+            if (!rows.length) return '<div style="color:var(--text-secondary)">暂无估值公式审计。</div>';
+            const body = rows.map(row => `<tr><td><b>${escapeHtml(row.scenario)}</b></td><td>${escapeHtml(row.target_year || '-')}</td><td>${formatResearchNumber(row.revenue)}</td><td>${formatResearchNumber(row.ebit)}</td><td>${formatResearchNumber(row.ebitda)}</td><td>${formatResearchNumber(row.free_cash_flow)}</td><td>${formatResearchNumber(row.net_profit)}</td><td>${escapeHtml(row.valuation_method || '-')}<div style="font-size:8px;color:var(--text-secondary)">${escapeHtml(row.method_selection_reason || '-')}</div></td><td>${formatResearchNumber(row.valuation_multiple,'×')}</td><td>${formatResearchNumber(row.enterprise_value)}</td><td>${formatResearchNumber(row.net_debt)}</td><td>${formatResearchNumber(row.equity_value)}</td><td><b>${formatResearchNumber(row.target_price)}</b></td><td>${formatProbability(row.probability)}</td><td>${formatResearchNumber(row.weighted_contribution)}</td><td style="min-width:300px;font-size:8px">${escapeHtml(row.valuation_chain || '-')}</td></tr>`).join('');
+            return `<div style="padding:8px;background:${item.passed ? '#e6f4ea' : '#fce8e6'};border-radius:6px;font-size:10px"><b>${item.passed ? 'VALUATION AUDIT PASS' : 'VALUATION AUDIT BLOCKED'}</b> · Complete ${item.complete_scenarios ? 'Yes' : 'No'} · Common Horizon ${item.common_horizon ? 'Yes' : 'No'} · Comparable ${item.valuation_methods_comparable ? 'Yes' : 'No'} · Identities ${item.all_identity_checks_passed ? 'PASS' : 'FAIL'} · Ordered Bear≤Base≤Bull ${item.ordered_targets ? 'Yes' : 'No'}</div><div style="overflow-x:auto;margin-top:8px"><table style="width:100%;min-width:2100px;border-collapse:collapse;font-size:9px"><thead><tr style="background:#f1f3f4"><th>Scenario</th><th>Year</th><th>Revenue</th><th>EBIT</th><th>EBITDA</th><th>FCF</th><th>Net Profit</th><th>Method / Reason</th><th>Multiple</th><th>EV</th><th>Net Debt</th><th>Equity Value</th><th>Target</th><th>Weight</th><th>Weighted</th><th>EV→Equity→Target Chain</th></tr></thead><tbody>${body}</tbody></table></div><div style="font-size:10px;margin-top:8px"><b>Weighted Target:</b> ${escapeHtml(item.weighted_target_formula || '-')}<br><b>Expected Return:</b> ${escapeHtml(item.expected_return_formula || '-')}</div>${(item.issues || []).length ? `<div style="color:var(--danger);margin-top:6px">${researchList(item.issues)}</div>` : ''}`;
+        }
+
+        function renderComparabilityAudit(audit) {
+            const item = audit || {};
+            const methods = Object.entries(item.methods_by_scenario || {}).map(([name, method]) => `${name}: ${method}`).join(' · ') || '-';
+            return `<div style="padding:9px;background:${item.passed ? '#e6f4ea' : '#fce8e6'};border-radius:7px;font-size:10px"><div><b>${item.passed ? 'COMPARABILITY PASS' : 'COMPARABILITY BLOCKED'}</b> · Same EV→Equity System ${item.same_valuation_system ? 'Yes' : 'No'} · Same Method ${item.same_primary_method ? 'Yes' : 'No'} · Cross-Method ${item.cross_method_switch ? 'Yes' : 'No'} · Sorting Reversal ${item.cross_method_sorting_reversal ? 'Yes' : 'No'} · Identities ${item.all_identity_checks_passed ? 'PASS' : 'FAIL'}</div><div style="margin-top:4px"><b>Methods:</b> ${escapeHtml(methods)}${item.common_primary_method ? ` · Common: ${escapeHtml(item.common_primary_method)}` : ''}</div>${(item.unsupported_multiple_scenarios || []).length ? `<div style="color:var(--danger);margin-top:4px"><b>Unsupported multiplier assumptions:</b> ${escapeHtml(item.unsupported_multiple_scenarios.join(', '))}</div>` : ''}${(item.issues || []).length ? `<div style="color:var(--danger);margin-top:5px">${researchList(item.issues)}</div>` : ''}</div>`;
+        }
+
+        function renderRequiredEarningsGap(audit) {
+            const item = audit || {};
+            const rows = Array.isArray(item.entries) ? item.entries : [];
+            if (!rows.length) return '<div style="color:var(--text-secondary)">Model-Implied Earnings 或同年 Agent Forecast 不可用。</div>';
+            return `<div style="padding:7px;background:${item.all_scenarios_below ? '#fce8e6' : '#fef7e0'};border-radius:6px;font-size:10px;margin-bottom:7px"><b>${escapeHtml(item.conclusion || '-')}</b> · Year ${escapeHtml(item.year || '-')} · Model-Implied Earnings ${formatResearchNumber(item.model_implied_earnings)}<div style="margin-top:3px;color:${item.required_earnings_above_bull ? '#d93025' : '#188038'};font-weight:700">${escapeHtml(item.model_implied_vs_bull_conclusion || '')}${item.model_implied_vs_bull_gap == null ? '' : ` · Gap ${formatResearchNumber(item.model_implied_vs_bull_gap)} (${formatRate(item.model_implied_vs_bull_gap_percentage)})`}</div></div><div style="overflow-x:auto"><table style="width:100%;min-width:850px;border-collapse:collapse;font-size:9px"><thead><tr style="background:#f1f3f4"><th>Scenario</th><th>Year</th><th>Model-Implied Earnings</th><th>Agent Forecast Earnings</th><th>Required Earnings Gap</th><th>Gap %</th><th>Status</th><th>Formula</th></tr></thead><tbody>${rows.map(row => `<tr><td><b>${escapeHtml(row.scenario)}</b></td><td>${escapeHtml(row.year)}</td><td>${formatResearchNumber(row.model_implied_earnings)}</td><td>${formatResearchNumber(row.agent_forecast_earnings)}</td><td>${formatResearchNumber(row.required_earnings_gap)}</td><td>${formatRate(row.gap_percentage)}</td><td>${escapeHtml(row.status)}</td><td>${escapeHtml(row.formula || '-')}</td></tr>`).join('')}</tbody></table></div>`;
+        }
+
+        function renderValuationGap(audit) {
+            const item = audit || {};
+            const rows = Array.isArray(item.entries) ? item.entries : [];
+            if (!rows.length) return '<div style="color:var(--text-secondary)">暂无 Valuation Gap。</div>';
+            return `<div style="font-size:10px;margin-bottom:7px"><b>Model-Implied Valuation:</b> Price ${formatResearchNumber(item.current_model_implied_price)} · Market Cap ${formatResearchNumber(item.current_model_implied_market_cap)}<div style="color:var(--text-secondary)">${escapeHtml(item.conclusion || '')}</div></div><div style="overflow-x:auto"><table style="width:100%;min-width:1050px;border-collapse:collapse;font-size:9px"><thead><tr style="background:#f1f3f4"><th>Scenario</th><th>Target</th><th>Price Gap</th><th>Return</th><th>Method</th><th>Scenario Multiple</th><th>Current Comparable Multiple</th><th>Multiple Δ</th><th>Multiple Δ%</th><th>Comparable</th></tr></thead><tbody>${rows.map(row => `<tr><td><b>${escapeHtml(row.scenario)}</b></td><td>${formatResearchNumber(row.target_price)}</td><td>${formatResearchNumber(row.price_gap)}</td><td>${formatRate(row.price_return)}</td><td>${escapeHtml(row.scenario_method || '-')}</td><td>${formatResearchNumber(row.scenario_multiple,'×')}</td><td>${formatResearchNumber(row.current_comparable_multiple,'×')}</td><td>${formatResearchNumber(row.multiple_change,'×')}</td><td>${formatRate(row.multiple_change_percentage)}</td><td>${row.multiple_comparable ? 'Yes' : 'No'}<div style="font-size:8px;color:var(--text-secondary)">${escapeHtml(row.note || '')}</div></td></tr>`).join('')}</tbody></table></div>`;
+        }
+
+        function renderValuationCandidates(item) {
+            const candidates = Array.isArray((item || {}).valuation_candidates) ? item.valuation_candidates : [];
+            if (!candidates.length) return '';
+            return `<div style="font-size:8px;color:var(--text-secondary);margin-top:3px">${candidates.map(candidate => `<div style="margin-top:3px">${candidate.selected ? '✓' : '·'} <b>${escapeHtml(candidate.method)}</b>: ${candidate.available ? `${formatResearchNumber(candidate.multiple,'×')} / TP ${formatResearchNumber(candidate.target_price)}` : escapeHtml(candidate.reason || 'unavailable')} · Evidence ${candidate.evidence_supported ? 'MATCHED' : 'BLOCKED'}${(candidate.evidence_validation_issues || []).length ? `<div style="color:#b06000">${escapeHtml(candidate.evidence_validation_issues.join('；'))}</div>` : ''}${(candidate.evidence_refs || []).length ? `<div>${escapeHtml(candidate.evidence_refs.join(', '))}</div>` : ''}</div>`).join('')}</div>`;
+        }
+
+        function renderSensitivityAudit(items) {
+            const values = Array.isArray(items) ? items : [];
+            if (!values.length) return '<div style="color:var(--text-secondary)">暂无敏感性审计。</div>';
+            return `<div style="overflow-x:auto"><table style="width:100%;min-width:850px;border-collapse:collapse;font-size:9px"><thead><tr style="background:#f1f3f4"><th>变量</th><th>Shock</th><th>Target Δ</th><th>Weighted Target Δ</th><th>影响比例</th><th>审计说明</th></tr></thead><tbody>${values.map(item => `<tr style="font-weight:${item.is_primary_driver ? '700' : '400'}"><td>${item.is_primary_driver ? '★ ' : ''}${escapeHtml(item.variable)}</td><td>${escapeHtml(item.shock)}</td><td>${formatResearchNumber(item.target_price_change)}</td><td>${formatResearchNumber(item.weighted_target_change)}</td><td>${formatRate(item.weighted_target_change_ratio)}</td><td>${escapeHtml(item.warning || item.calculation || '-')}</td></tr>`).join('')}</tbody></table></div>`;
+        }
+
+        function buildEvidenceIndex(items) {
+            return new Map((Array.isArray(items) ? items : []).filter(item => item && item.id).map(item => [item.id, item]));
+        }
+
+        function renderCompactEvidence(refs, evidenceItems) {
+            const ids = Array.isArray(refs) ? refs : [];
+            if (!ids.length) return '<div style="font-size:10px;color:var(--text-secondary);margin-top:6px">暂无关联证据</div>';
+            const index = buildEvidenceIndex(evidenceItems);
+            return `<div style="display:grid;gap:5px;margin-top:7px">${ids.map(id => {
+                const item = index.get(id);
+                if (!item) return `<div style="font-size:10px;color:var(--danger)">证据详情未找到：${escapeHtml(id)}</div>`;
+                const date = item.publication_date || item.information_date || (item.retrieved_at || '').slice(0, 10) || '日期未知';
+                const futureInvalid = item.temporal_scope === 'future'
+                    ? `<div style="color:var(--danger);font-weight:700;margin-top:3px">Future / Look-ahead Invalid${item.invalid_reason ? `：${escapeHtml(item.invalid_reason)}` : ''}</div>`
+                    : '';
+                return `<div style="padding:6px 8px;background:#f8f9fa;border-radius:5px;font-size:10px;line-height:1.55"><b>${escapeHtml(item.fact || item.excerpt || '未提供事实摘要')}</b><div style="color:var(--text-secondary);margin-top:2px">${escapeHtml(item.source || '来源未知')} · ${escapeHtml(date)} · ${escapeHtml(id)}</div>${futureInvalid}</div>`;
+            }).join('')}</div>`;
+        }
+
+        function renderConsistencyReport(snapshot) {
+            const report = (snapshot || {}).consistency_report || {};
+            const issues = Array.isArray(report.issues) ? report.issues : [];
+            const allowed = report.valuation_allowed === true;
+            return `<div style="padding:10px;border-left:5px solid ${allowed ? '#188038' : '#d93025'};background:${allowed ? '#e6f4ea' : '#fce8e6'};border-radius:7px">
+                <div style="display:flex;justify-content:space-between;gap:8px;align-items:center"><b>Market Snapshot Consistency</b><span style="font-weight:700;color:${allowed ? '#188038' : '#d93025'}">Valuation Allowed: ${allowed ? 'Yes' : 'No'}</span></div>
+                <div style="font-size:11px;margin-top:5px">${escapeHtml(report.summary || '尚未执行数据一致性校验')}</div>
+                ${issues.length ? `<div style="display:grid;gap:6px;margin-top:8px">${issues.map(issue => `<div style="padding:7px;background:white;border-radius:6px;font-size:10px"><div style="display:flex;justify-content:space-between;gap:8px"><b>${escapeHtml(issue.check || '未命名检查')}</b><span style="color:${issue.passed ? '#188038' : (issue.severity === 'error' ? '#d93025' : '#b06000')};font-weight:700">${issue.passed ? 'PASS' : 'FAIL'} · ${escapeHtml(issue.severity || 'info')}</span></div><div style="margin-top:3px">${escapeHtml(issue.message || '-')}</div><div style="color:var(--text-secondary);margin-top:2px">Expected: ${escapeHtml(issue.expected || '-')} · Actual: ${escapeHtml(issue.actual || '-')}</div></div>`).join('')}</div>` : '<div style="font-size:10px;color:var(--text-secondary);margin-top:6px">No consistency issues reported.</div>'}
+            </div>`;
+        }
+
+        function renderOpportunityMapping(company, evidenceItems) {
+            const mappings = Array.isArray((company || {}).opportunity_mapping) ? company.opportunity_mapping : [];
+            if (!mappings.length) return '<div style="color:var(--text-secondary)">暂无公司机会映射</div>';
+            return `<div style="overflow-x:auto"><table style="width:100%;min-width:1700px;border-collapse:collapse;font-size:9px"><thead><tr style="background:#f1f3f4"><th>机会 / 公司能力 / 捕获机制</th><th>Industry Growth</th><th>Company Revenue Growth</th><th>Current Share</th><th>Target Share</th><th>Share Change</th><th>Company Capture Rate</th><th>Gross Margin Impact</th><th>Net Profit Impact</th><th>Lag</th><th>Target Period</th><th>Status</th><th>Gate</th></tr></thead><tbody>${mappings.map(item => `<tr><td><b>${escapeHtml(item.industry_change || '-')}</b><div style="color:var(--text-secondary)">${escapeHtml(item.company_capability || '-')} → ${escapeHtml(item.capture_mechanism || '-')}</div>${(item.blockers || []).length ? `<div style="color:#b06000">Blockers: ${escapeHtml(item.blockers.join('；'))}</div>` : ''}${renderCompactEvidence(item.evidence_refs, evidenceItems)}</td><td>${formatRate(item.industry_growth_rate)}</td><td>${formatRate(item.company_revenue_growth_rate)}</td><td>${formatRate(item.current_market_share)}</td><td>${formatRate(item.target_market_share)}</td><td>${formatRate(item.market_share_change)}</td><td>${formatResearchNumber(item.company_capture_rate,'×')}</td><td>${formatRate(item.gross_margin_impact)}</td><td>${formatRate(item.net_profit_impact)}</td><td>${item.transmission_lag_months == null ? '-' : `${formatResearchNumber(item.transmission_lag_months)} months`}</td><td>${escapeHtml(item.target_period || '-')}</td><td>${escapeHtml(item.validation_status || '-')}</td><td>${renderGateBadge(item.evidence_gate) || '-'}</td></tr>`).join('')}</tbody></table></div>`;
+        }
+
+        function renderLogicTree(tree, evidenceItems) {
+            const value = tree || {};
+            const nodes = Array.isArray(value.nodes) ? value.nodes : [];
+            if (!nodes.length) return '<div style="color:var(--text-secondary);font-size:12px">暂无逻辑树数据</div>';
+            const labels = {investment:'Investment Logic Tree', financial:'Financial Logic Tree', risk:'Risk Logic Tree'};
+            return `<div style="padding:9px;background:#f8f9fa;border-radius:7px"><div style="display:flex;justify-content:space-between;gap:8px"><b>${escapeHtml(labels[value.tree_type] || 'Logic Tree')}</b><span class="tag">Root: ${escapeHtml(value.root_id || '-')}</span></div>${value.summary ? `<div style="font-size:11px;margin-top:5px">${escapeHtml(value.summary)}</div>` : ''}<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:8px;margin-top:8px">${nodes.map(node => `<div style="padding:9px;border:1px solid var(--border);border-top:4px solid ${node.node_id === value.root_id ? '#1a73e8' : '#9aa0a6'};border-radius:7px;background:white"><div style="display:flex;justify-content:space-between;gap:6px"><b>${escapeHtml(node.node_id)} · ${escapeHtml(node.label || '-')}</b>${node.probability == null ? '' : `<span style="font-weight:700;color:#1a73e8">${formatRate(node.probability)}</span>`}</div>${node.metric ? `<div style="font-size:10px;margin-top:5px"><b>${escapeHtml(node.metric)}:</b> ${formatResearchNumber(node.value)} ${escapeHtml(node.unit || '')}${node.period ? ` · ${escapeHtml(node.period)}` : ''}</div>` : ''}<div style="font-size:9px;color:var(--text-secondary);margin-top:5px">Depends on: ${escapeHtml((node.depends_on || []).join(' → ') || 'Root input')}</div>${renderCompactEvidence(node.evidence_refs, evidenceItems)}</div>`).join('')}</div></div>`;
+        }
+
+        function researchChinese(value) {
+            let text = String(value == null ? '' : value);
+            const replacements = [
+                ['ACTIONABLE EDGE','已经形成比较明确的投资机会'], ['EMERGING EDGE','开始出现投资机会'],
+                ['INVALIDATED','原来的判断已经被证据推翻'], ['NO EDGE','暂未发现明确投资优势'], ['WATCH','值得观察'],
+                ['Pre-Valuation Probability Gate','估值前情景概率检查'], ['Probability of Negative Return','出现负收益的概率'],
+                ['Annualized Expected Return','年化预期收益率'], ['Required Return','要求达到的回报率'],
+                ['Model-Implied Earnings','当前股价隐含的盈利要求'], ['Model-Implied Expectation','当前股价隐含的经营要求'],
+                ['Market Consensus','市场一致预期'], ['Agent Forecast','模型预测'], ['Expected Return','预期收益率'],
+                ['Investment Edge','投资优势/预期差'], ['Downside Event','悲观事件'], ['Downside Risk','下行风险'],
+                ['Counter Evidence','反对证据'], ['Evidence Gate','证据检查关卡'],
+                ['Forecast Reasonableness','预测是否合理'], ['Scenario Separation','不同情景是否由真实经营变量区分'],
+                ['Comparable Valuation','可比公司估值'], ['Margin Expansion','毛利率提升'], ['Valuation Re-rating','估值提升'],
+                ['Historical Anchor','历史数据参照'], ['Margin Bridge','利润率传导检查'],
+                ['Catalyst','催化因素（可能推动股价变化的事件）'], ['Target Price','目标价'], ['Revenue Growth','营业收入增长率'],
+                ['Revenue','营业收入'], ['Gross Margin','毛利率'], ['Gross Profit','毛利润'], ['Net Profit','净利润'],
+                ['Net Margin','净利率'], ['D&A','折旧与摊销'], ['FCF','自由现金流'],
+                ['EV/EBITDA','企业价值/息税折旧摊销前利润'], ['EV/Sales','企业价值/营业收入'],
+                ['EBITDA','息税折旧摊销前利润'], ['EBIT Margin','营业利润率'], ['EBIT','营业利润'],
+                ['PE TTM','滚动市盈率'], ['PE','市盈率'], ['PB','市净率'],
+                ['Edge available','投资优势是否可计算'], ['Total score','总分'], ['Story Chain','故事因果链'],
+                ['Red Team','反方检验'], ['Bear Case','悲观情景检验'], ['Scenario Valuation','情景估值'],
+                ['Probability Agent','概率模型'], ['Bull Thesis','乐观情景成立概率'], ['Equity Value','股东价值'],
+                ['Mispricing','预期差'], ['Valuation','估值'], ['Expectation','预期'], ['Verification','验证指标'],
+                ['Re-rating','估值变化'], ['Earnings','盈利'], ['Benchmark','比较基准'], ['As Of','数据日期'],
+                ['business_mix','业务结构'], ['product_mix','产品结构'], ['valuation_multiple','估值倍数'],
+                ['supported_drivers','有证据支持的驱动因素数量'], ['all_drivers','全部驱动因素数量'],
+                ['historical_anchor','历史数据参照'], ['margin_bridge','利润率传导检查'],
+                ['scenario_separation','不同情景是否由真实经营变量区分'], ['margin_expansion_evidence','毛利率提升证据'],
+                ['valid_catalysts','有效催化因素'], ['annualized_expected_return','年化预期收益率'],
+                ['required_return','要求达到的回报率'], ['p_bear','悲观情景概率'],
+                ['probability_of_negative_return','出现负收益的概率'], ['maximum_absolute_gap_ratio','最大绝对差距比例'],
+                ['probability_generation','概率生成阶段'], ['model_implied','当前股价隐含的要求'],
+                ['agent_forecast','模型预测'], ['market_consensus','市场一致预期'], ['De-rating','估值下调'],
+                ['de-rating','估值下调'], ['ratio','比例'], ['vs','对比'], ['available','有可靠数据'],
+                ['market_vs_agent_earnings_gap','市场与模型盈利差距'],
+                ['competition','竞争'], ['strategy','战略'], ['governance','公司治理'], ['valuation','估值'],
+                ['demand','需求'], ['cash_flow','现金流'], ['receivables','应收账款'], ['inventory','存货'], ['technology','技术'],
+                ['critical','严重'], ['high','高'], ['medium','中'], ['low','低'],
+                ['one_year','未来一年'], ['half_year','未来半年'], ['quarter','下一季度'], ['30d','未来30天'],
+                ['two_sided','双向'], ['other','其他'], ['Time','时间'], ['Case','检验'], ['Ref','证据编号'],
+                ['Evidence','证据'], ['Probability','概率'], ['Gap','差距'], ['Gate','检查关卡'],
+                ['SUPPORTED','有证据支持'], ['UNSUPPORTED','缺少证据'], ['BLOCKED','被阻断'], ['FAILED','未通过'],
+                ['UNAVAILABLE','暂无可靠数据'], ['PASS','通过'], ['VALID','有效'], ['INVALID','无效'],
+                ['YES','是'], ['NO','否'], ['true','是'], ['false','否'],
+                ['unavailable','暂无可靠数据'], ['Unavailable','暂无可靠数据'], ['null','暂时无法计算']
+            ];
+            replacements.forEach(([source, target]) => {
+                const escaped = source.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                text = text.replace(new RegExp(`(?<![A-Za-z0-9_])${escaped}(?![A-Za-z0-9_])`, 'g'), target);
+            });
+            return text.replace(/(\d+(?:\.\d+)?)\s*pct\b/gi,'$1个百分点').replace(/(?<![A-Za-z0-9_])Base(?![A-Za-z0-9_])/g,'基准情景').replace(/(?<![A-Za-z0-9_])Bear(?![A-Za-z0-9_])/g,'悲观情景').replace(/(?<![A-Za-z0-9_])Bull(?![A-Za-z0-9_])/g,'乐观情景');
+        }
+
+        function renderInvestorPresentation(presentation) {
+            const value = presentation || {};
+            const conclusions = Array.isArray(value.quick_conclusions) ? value.quick_conclusions : [];
+            const block = value.return_block || {};
+            const metrics = Array.isArray(value.metric_explanations) ? value.metric_explanations : [];
+            const chains = Array.isArray(value.causal_chains) ? value.causal_chains : [];
+            const verdict = researchChinese(value.verdict_label || '暂无明确结论');
+            const color = verdict.includes('明确') || verdict.includes('机会') ? '#188038' : (verdict.includes('推翻') ? '#d93025' : '#b06000');
+            const cards = conclusions.map((item, index) => `<div style="padding:12px;border:1px solid var(--border);border-left:4px solid ${index === 6 ? color : '#1a73e8'};border-radius:8px;background:white"><div style="font-size:11px;color:var(--text-secondary)">${index + 1}. ${escapeHtml(researchChinese(item.question))}</div><b style="display:block;font-size:14px;line-height:1.6;margin-top:4px">${escapeHtml(researchChinese(item.conclusion))}</b><div style="font-size:11px;line-height:1.7;margin-top:7px"><b>为什么：</b>${escapeHtml(researchChinese(item.why))}<br><b>数据：</b>${escapeHtml(researchChinese(item.data))}<br><b>这意味着什么：</b>${escapeHtml(researchChinese(item.implication))}</div></div>`).join('');
+            const metricCards = metrics.map(item => `<div style="padding:10px;background:#f8f9fa;border-radius:7px"><b>${escapeHtml(researchChinese(item.name))}</b><div style="font-size:11px;line-height:1.7;margin-top:4px">${escapeHtml(researchChinese(item.explanation))}</div><div style="font-size:9px;color:var(--text-secondary);margin-top:5px">计算方法：${escapeHtml(researchChinese(item.formula))}</div></div>`).join('');
+            const chainCards = chains.map(chain => `<div style="display:flex;align-items:stretch;gap:5px;overflow-x:auto;padding:8px 0">${chain.map((step, index) => `<div style="min-width:175px;padding:9px;background:#e8f0fe;border-radius:7px;font-size:10px;line-height:1.6"><b>${index + 1}</b><br>${escapeHtml(researchChinese(step))}</div>${index < chain.length - 1 ? '<div style="align-self:center;font-size:18px;color:#1a73e8">→</div>' : ''}`).join('')}</div>`).join('');
+            return `<div class="card" style="border-top:6px solid ${color}"><div style="display:flex;justify-content:space-between;gap:12px;align-items:flex-start"><div><div style="font-size:11px;color:var(--text-secondary)">先看结论 · 面向普通投资者</div><b style="font-size:22px;color:${color}">${escapeHtml(verdict)}</b><div style="margin-top:5px">${escapeHtml(researchChinese(value.verdict_explanation || ''))}</div></div><span class="tag">简体中文</span></div>
+                <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:9px;margin-top:13px">${cards || '<div>暂无可靠结论</div>'}</div>
+                <div style="margin-top:13px;padding:12px;background:${block.blocked ? '#fce8e6' : '#e6f4ea'};border-radius:8px"><b style="font-size:14px">${escapeHtml(researchChinese(block.headline || ''))}</b>${(block.reasons || []).length ? `<ol style="margin:7px 0 0 20px;line-height:1.7">${block.reasons.map(reason => `<li>${escapeHtml(researchChinese(reason))}</li>`).join('')}</ol>` : ''}${block.why_stop ? `<div style="font-size:11px;margin-top:7px"><b>系统为什么停下来：</b>${escapeHtml(researchChinese(block.why_stop))}</div>` : ''}</div>
+                ${metricCards ? `<h4 style="margin:14px 0 6px">复杂指标怎么理解</h4><div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:8px">${metricCards}</div>` : ''}
+                ${chainCards ? `<h4 style="margin:14px 0 4px">投资逻辑因果链</h4>${chainCards}` : ''}
+                <div style="display:grid;grid-template-columns:repeat(2,1fr);gap:9px;margin-top:12px"><div style="padding:10px;background:#fce8e6;border-radius:7px"><b>不能忽略的风险</b>${researchList((value.important_risks || []).map(researchChinese))}</div><div style="padding:10px;background:#e8f0fe;border-radius:7px"><b>接下来观察什么</b>${researchList((value.next_observations || []).map(researchChinese))}</div></div>
+            </div>`;
+        }
+
+        function renderUnifiedEvidenceStatus(mispricing) {
+            const value = mispricing || {};
+            const layer = value.evidence_status_layer || {};
+            const verdict = value.evidence_based_verdict || {};
+            const plan = value.evidence_acquisition_plan || {};
+            const items = Array.isArray(layer.items) ? layer.items : [];
+            const plans = Array.isArray(plan.items) ? plan.items : [];
+            const statusColors = {'已验证':'#188038','部分验证':'#b06000','无法验证':'#5f6368','已证伪':'#d93025','互相矛盾':'#8430ce'};
+            const verdictColors = {'已证伪：不成立':'#d93025','证据不足：暂不能判断':'#b06000','已验证但估值不划算':'#5f6368','已验证且存在预期差':'#1a73e8','已验证且达到可投资条件':'#188038'};
+            const color = verdictColors[verdict.status] || '#5f6368';
+            const evidenceText = refs => (refs || []).length
+                ? refs.map(ref => `${escapeHtml(ref.evidence_id || '-')} · ${escapeHtml(ref.source || '未知来源')} · ${escapeHtml(ref.source_grade || '-')}级${ref.current_and_valid ? ' · 当前有效' : ' · 未满足要求'}`).join('<br>')
+                : '未找到';
+            const rows = items.map(item => `<tr><td><b>${escapeHtml(item.title || item.assumption_id)}</b><div style="font-size:8px;color:var(--text-secondary)">${escapeHtml(item.category || '')} · ${escapeHtml(item.scenario || '')} ${escapeHtml(item.year || '')}</div></td><td><span style="color:${statusColors[item.current_status] || '#5f6368'};font-weight:700">${escapeHtml(item.current_status || '无法验证')}</span><div style="font-size:8px">${escapeHtml(item.logic_status || '无法判断')}</div></td><td>${evidenceText(item.support_evidence)}</td><td>${evidenceText(item.counter_evidence)}</td><td>${escapeHtml((item.missing_evidence || []).join('；') || '无')}</td><td>${escapeHtml(item.next_verification || '-')}</td><td><b>${escapeHtml(item.one_sentence_conclusion || '-')}</b><div style="font-size:8px;margin-top:3px">为什么：${escapeHtml(item.why || '-')}<br>数据：${escapeHtml(item.data || '-')}<br>这意味着什么：${escapeHtml(item.implication || '-')}</div></td></tr>`).join('');
+            const planRows = plans.map(item => `<tr><td><b>${formatResearchNumber(item.rank)}</b></td><td>${escapeHtml(item.assumption_title || item.assumption_id)}</td><td>${escapeHtml(item.current_status || '-')}</td><td><b>${escapeHtml(item.evidence_to_find || '-')}</b><div style="font-size:8px">要求：${escapeHtml(item.required_quality || '-')}</div></td><td>${escapeHtml((item.preferred_sources || []).join('、') || '-')}</td><td>${escapeHtml(item.why_high_value || '-')}</td><td>${escapeHtml((item.expected_unblock || []).join('、') || '-')}</td></tr>`).join('');
+            return `<div style="border:2px solid ${color};border-radius:10px;padding:14px;background:white;margin-bottom:12px"><div style="display:flex;justify-content:space-between;gap:12px;align-items:flex-start"><div><div style="font-size:10px;color:var(--text-secondary)">最终投资判断（证据充分性优先）</div><b style="font-size:21px;color:${color}">${escapeHtml(verdict.status || '证据不足：暂不能判断')}</b></div><div style="font-size:10px;text-align:right">主要原因：<b>${escapeHtml(verdict.primary_reason_type || '证据不足')}</b><br>关键假设 ${formatResearchNumber(layer.critical_verified_count)} / ${formatResearchNumber(layer.critical_item_count)} 已验证</div></div><div style="margin-top:9px;padding:10px;background:#f8f9fa;border-radius:7px"><b>一句话结论：${escapeHtml(verdict.one_sentence_conclusion || layer.one_sentence_conclusion || '-')}</b><div style="margin-top:5px;font-size:11px;line-height:1.65">为什么：${escapeHtml(verdict.why || '-')}<br>数据：${escapeHtml(verdict.data || layer.data || '-')}<br>这意味着什么：${escapeHtml(verdict.implication || '-')}</div></div><div style="margin-top:9px;padding:8px;background:${verdict.actionable_edge_allowed ? '#e6f4ea' : '#fef7e0'};border-radius:6px;font-size:10px">目标价：${verdict.target_price_allowed ? '允许输出' : '保持关闭'}　预期收益率：${verdict.expected_return_allowed ? '允许输出' : '保持关闭'}　可执行投资优势：${verdict.actionable_edge_allowed ? '允许输出' : '保持关闭'}</div><details open style="margin-top:10px"><summary style="cursor:pointer;font-weight:700">关键假设：支持证据、反方证据与缺口</summary><div style="overflow-x:auto;margin-top:6px"><table style="width:100%;min-width:1700px;border-collapse:collapse;font-size:9px"><thead><tr><th>假设</th><th>当前状态</th><th>支持证据</th><th>反方证据</th><th>缺失证据</th><th>下一步验证</th><th>结论解释</th></tr></thead><tbody>${rows}</tbody></table></div></details><details open style="margin-top:10px"><summary style="cursor:pointer;font-weight:700">证据获取计划（按解除阻断价值排序）</summary><div style="font-size:10px;margin:5px 0">${escapeHtml(plan.one_sentence_conclusion || '暂无计划')}</div><div style="overflow-x:auto"><table style="width:100%;min-width:1400px;border-collapse:collapse;font-size:9px"><thead><tr><th>顺序</th><th>关键假设</th><th>状态</th><th>最值得寻找的证据</th><th>优先来源</th><th>为什么价值高</th><th>预计解除</th></tr></thead><tbody>${planRows}</tbody></table></div></details></div>`;
+        }
+
+        function renderMispricingAnalysis(mispricing, evidenceItems) {
+            const value = mispricing || {};
+            const verdict = value.verdict || {};
+            const gate = value.gate || {};
+            const draft = value.narrative_draft || {};
+            const edge = value.edge || {};
+            const maximum = value.maximum_gap || {};
+            const drivers = Array.isArray(value.drivers) ? value.drivers : [];
+            const falsifiers = Array.isArray(value.falsifiable_conditions) ? value.falsifiable_conditions : [];
+            const chains = Array.isArray(value.chains) ? value.chains : [];
+            const points = Array.isArray(value.expectation_points) ? value.expectation_points : [];
+            const gaps = Array.isArray(value.gaps) ? value.gaps : [];
+            const classification = value.classification || {};
+            const colors = {'NO EDGE':'#5f6368','WATCH':'#b06000','EMERGING EDGE':'#1a73e8','ACTIONABLE EDGE':'#188038','INVALIDATED':'#d93025'};
+            const color = colors[verdict.status] || '#5f6368';
+            const answers = [
+                ['① 市场现在在赌什么', draft.market_bet || value.market_expectation_summary || 'Market Consensus unavailable'],
+                ['② Agent 认为哪里错', draft.agent_disagreement || '未形成可验证分歧'],
+                ['③ 为什么认为错', draft.why_market_may_be_wrong || '缺少通过Evidence Gate的驱动证据'],
+                ['④ 最大预期差', verdict.maximum_gap || '未发现显著Base Gap'],
+                ['⑤ 重新定价事件', verdict.repricing_event || '缺少通过Evidence Gate的Catalyst'],
+                ['⑥ 什么时候验证', verdict.verification_deadline || '未定义'],
+                ['⑦ 如果错了哪里失败', verdict.failure_point || '未定义结构化Falsifier'],
+                ['⑧ 当前是否可投资', `${verdict.investable ? '是' : '否'} · ${verdict.summary || 'NO EDGE'}`],
+            ];
+            const pointRows = points.map(row => `<tr><td><b>${escapeHtml(row.series_type)}</b></td><td>${escapeHtml(row.scenario || '-')}</td><td>${escapeHtml(row.period)}</td><td>${escapeHtml(row.metric)}</td><td>${formatResearchNumber(row.value)} ${escapeHtml(row.unit || '')}</td><td>${row.available ? 'Available' : 'Unavailable'}</td><td style="min-width:300px">${escapeHtml(row.derivation || '-')}${renderCompactEvidence(row.evidence_refs, evidenceItems)}</td></tr>`).join('');
+            const gapRows = gaps.map(row => `<tr style="background:${row.gap_id === maximum.gap_id ? '#fef7e0' : 'white'}"><td><b>${escapeHtml(row.gap_id)}</b></td><td>${escapeHtml(row.scenario)}</td><td>${escapeHtml(row.period)}</td><td>${escapeHtml(row.metric)}</td><td>${escapeHtml(row.benchmark_type)}</td><td>${formatResearchNumber(row.benchmark_value)}</td><td>${formatResearchNumber(row.agent_value)}</td><td>${formatResearchNumber(row.absolute_gap)}</td><td>${formatRate(row.gap_percentage)}</td><td style="color:${row.significant ? '#d93025' : '#5f6368'}">${row.significant ? 'SIGNIFICANT' : 'Below threshold'} · ${escapeHtml(row.direction)}</td></tr>`).join('');
+            const driverCards = drivers.map(row => `<div style="padding:10px;border-left:4px solid ${row.supported ? '#188038' : '#d93025'};background:${row.supported ? '#e6f4ea' : '#fce8e6'};border-radius:7px"><div style="display:flex;justify-content:space-between;gap:8px"><b>${escapeHtml(row.driver_id)} · ${escapeHtml(row.driver_type)}</b><span>${row.supported ? 'SUPPORTED' : 'BLOCKED'}</span></div><div style="margin-top:5px"><b>判断：</b>${escapeHtml(row.claim || '-')}</div><div style="font-size:10px;margin-top:4px"><b>机制：</b>${escapeHtml(row.mechanism || '-')}<br><b>验证：</b>${escapeHtml(row.verification_metric || '-')} · ${escapeHtml(row.time_window || '-')}<br><b>重定价：</b>${escapeHtml(row.rerating_mechanism || '-')}<br><b>Catalyst：</b>${escapeHtml((row.catalyst_ids || []).join(', ') || '-')}</div>${renderCompactEvidence(row.evidence_refs, evidenceItems)}${(row.counter_evidence_refs || []).length ? `<div style="margin-top:5px"><b>反对证据</b>${renderCompactEvidence(row.counter_evidence_refs, evidenceItems)}</div>` : ''}${(row.issues || []).length ? `<div style="color:#d93025">${researchList(row.issues)}</div>` : ''}</div>`).join('');
+            const falsifierRows = falsifiers.map(row => `<tr><td><b>${escapeHtml(row.condition_id)}</b><div>${escapeHtml(row.driver_id)}</div></td><td>${escapeHtml(row.current_judgment || '-')}</td><td>${escapeHtml((row.key_variables || []).join('；') || '-')}</td><td>${escapeHtml(row.verification_metric || '-')}</td><td>${escapeHtml(row.confirms_if || '-')}</td><td>${escapeHtml(row.invalidates_if || '-')}</td><td>${escapeHtml(row.latest_verification_time || '-')}</td><td style="color:${row.currently_invalidated ? '#d93025' : (row.complete ? '#188038' : '#b06000')}">${row.currently_invalidated ? 'INVALIDATED' : (row.complete ? row.current_status : 'INCOMPLETE')}</td></tr>`).join('');
+            const chainRows = chains.map(row => `<tr><td>${escapeHtml(row.driver_id)}</td><td>${escapeHtml(row.market_expectation)}</td><td>${escapeHtml(row.agent_expectation)}</td><td>${escapeHtml(row.gap_id)}</td><td>${escapeHtml((row.catalyst_ids || []).join(', ') || '-')}</td><td>${escapeHtml(row.verification_metric || '-')}</td><td>${escapeHtml(row.time_window || '-')}</td><td>${escapeHtml(row.repricing_mechanism || '-')}</td><td style="color:${row.complete ? '#188038' : '#d93025'}"><b>${row.complete ? 'COMPLETE' : 'BLOCKED'}</b>${(row.issues || []).length ? researchList(row.issues) : ''}</td></tr>`).join('');
+            const componentCards = (edge.components || []).map(row => `<div style="padding:9px;background:${row.available ? '#f8f9fa' : '#fce8e6'};border-radius:7px"><div style="display:flex;justify-content:space-between;gap:7px"><b>${escapeHtml(row.name)}</b><b>${row.score == null ? 'null' : formatResearchNumber(row.score)}</b></div><div style="font-size:9px;margin-top:5px">${escapeHtml(row.formula || '-')}</div><div style="font-size:9px;color:var(--text-secondary);margin-top:4px">Inputs: ${escapeHtml(JSON.stringify(row.inputs || {}))}</div>${(row.issues || []).length ? `<div style="color:#d93025">${researchList(row.issues)}</div>` : ''}</div>`).join('');
+            const statusItems = [
+                ['价格便宜', classification.price_cheap, 'price_cheap'],
+                ['市场预期过高', classification.market_expectation_too_high, 'market_expectation_too_high'],
+                ['市场预期过低', classification.market_expectation_too_low, 'market_expectation_too_low'],
+                ['基本面正在改善', classification.fundamentals_improving, 'fundamentals_improving'],
+                ['估值正在重估', classification.valuation_rerating, 'valuation_rerating'],
+            ];
+            return `<div class="card" style="border-left:7px solid ${color}"><div style="display:flex;justify-content:space-between;gap:12px;align-items:flex-start"><div><div style="font-size:10px;color:var(--text-secondary)">Independent Expectation / Mispricing Agent · Program Derived Verdict</div><b style="font-size:22px;color:${color}">${escapeHtml(verdict.status || 'NO EDGE')}</b><div style="margin-top:5px">${escapeHtml(verdict.summary || '-')}</div></div><div style="text-align:right"><b>Edge ${edge.available ? formatResearchNumber(edge.total_score) : 'null'}</b><br><span style="font-size:10px">Benchmark: ${escapeHtml(verdict.primary_benchmark || 'unavailable')}<br>Gate: ${gate.passed ? 'PASS' : 'BLOCKED'}</span></div></div>
+                <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:8px;margin-top:12px">${answers.map(([label,text]) => `<div style="padding:10px;background:#f8f9fa;border-radius:7px"><b>${escapeHtml(label)}</b><div style="font-size:11px;line-height:1.65;margin-top:4px">${escapeHtml(text)}</div></div>`).join('')}</div>
+                <div style="display:grid;grid-template-columns:repeat(5,minmax(150px,1fr));gap:7px;margin-top:11px">${statusItems.map(([label,active,key]) => `<div title="${escapeHtml((classification.basis || {})[key] || '')}" style="padding:8px;border-radius:7px;background:${active ? '#e8f0fe' : '#f1f3f4'};color:${active ? '#1a73e8' : '#5f6368'}"><b>${active ? 'YES' : 'NO'} · ${escapeHtml(label)}</b><div style="font-size:8px;margin-top:3px">${escapeHtml((classification.basis || {})[key] || '-')}</div></div>`).join('')}</div>
+                <h4 style="margin:15px 0 6px">Market Expectation / Model-Implied / Agent Forecast</h4><div style="padding:8px;background:#fef7e0;border-radius:6px;font-size:10px"><b>Market Consensus:</b> ${escapeHtml(value.market_expectation_summary || 'unavailable')}<br><b>Model-Implied:</b> ${escapeHtml(value.model_implied_summary || 'unavailable')}<br><b>Agent Forecast:</b> ${escapeHtml(value.agent_forecast_summary || 'unavailable')}</div><details style="margin-top:7px"><summary style="cursor:pointer;font-weight:700">权威序列明细</summary><div style="overflow-x:auto"><table style="width:100%;min-width:1100px;border-collapse:collapse;font-size:9px"><thead><tr><th>Series</th><th>Scenario</th><th>Period</th><th>Metric</th><th>Value</th><th>Status</th><th>Derivation / Evidence</th></tr></thead><tbody>${pointRows}</tbody></table></div></details>
+                <h4 style="margin:15px 0 6px">Expectation Gap</h4><div style="overflow-x:auto"><table style="width:100%;min-width:1250px;border-collapse:collapse;font-size:9px"><thead><tr><th>ID</th><th>Scenario</th><th>Period</th><th>Metric</th><th>Benchmark</th><th>Benchmark Value</th><th>Agent</th><th>Gap</th><th>Gap%</th><th>Direction</th></tr></thead><tbody>${gapRows}</tbody></table></div>
+                <h4 style="margin:15px 0 6px">Gap Drivers / Evidence Strength</h4><div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:8px">${driverCards || '<div style="color:var(--text-secondary)">无结构化Driver；Edge保持null。</div>'}</div>
+                <h4 style="margin:15px 0 6px">Gap→Driver→Evidence→Catalyst→Verification→Time→Re-rating</h4><div style="overflow-x:auto"><table style="width:100%;min-width:1450px;border-collapse:collapse;font-size:9px"><thead><tr><th>Driver</th><th>Market</th><th>Agent</th><th>Gap</th><th>Catalyst</th><th>Verification</th><th>Time</th><th>Re-rating</th><th>Status</th></tr></thead><tbody>${chainRows}</tbody></table></div>
+                <h4 style="margin:15px 0 6px">Falsifiable Conditions</h4><div style="overflow-x:auto"><table style="width:100%;min-width:1500px;border-collapse:collapse;font-size:9px"><thead><tr><th>Condition</th><th>Current Judgment</th><th>Key Variables</th><th>Metric</th><th>Confirms If</th><th>Invalidates If</th><th>Deadline</th><th>Status</th></tr></thead><tbody>${falsifierRows}</tbody></table></div>
+                <h4 style="margin:15px 0 6px">Investment Edge · Six Deterministic Components</h4><div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:8px">${componentCards}</div>${(edge.blockers || []).length ? `<div style="color:#d93025;margin-top:8px"><b>Edge Blockers</b>${researchList(edge.blockers)}</div>` : ''}
+                ${(gate.issues || []).length ? `<details style="margin-top:10px"><summary style="cursor:pointer;font-weight:700;color:#b06000">Mispricing Gate Issues</summary>${researchList(gate.issues)}</details>` : ''}
+            </div>`;
+        }
+
+        function renderExpectationAnalysis(expectation, valuation, evidenceItems) {
+            const implied = [expectation.price_implied_path, expectation.market_implied_path, valuation.reverse_valuation].find(items => Array.isArray(items) && items.length) || [];
+            const comparisons = Array.isArray(valuation.forecast_comparison) ? valuation.forecast_comparison : [];
+            const consensusEstimates = Array.isArray(expectation.consensus_estimates) ? expectation.consensus_estimates : [];
+            const impliedByYear = new Map(implied.map(item => [item.year, item]));
+            const comparisonByYear = new Map(comparisons.map(item => [item.year, item]));
+            const consensusByYear = new Map(consensusEstimates.map(item => [item.year, item]));
+            const years = [...new Set([...impliedByYear.keys(), ...comparisonByYear.keys(), ...consensusByYear.keys()])];
+            const rows = years.map(year => {
+                const item = impliedByYear.get(year) || {};
+                const comparison = comparisonByYear.get(year) || {};
+                const consensus = consensusByYear.get(year) || {};
+                const consensusAvailable = comparison.consensus_available === true || consensus.available === true;
+                const consensusProfit = comparison.consensus_profit ?? consensus.net_profit;
+                const modelImpliedProfit = comparison.model_implied_profit ?? comparison.market_implied_profit ?? item.implied_net_profit;
+                const agentForecastProfit = comparison.agent_forecast_profit ?? comparison.agent_base_profit;
+                const direction = comparison.direction || 'unknown';
+                const colors = {positive:'#d93025',negative:'#188038',neutral:'#5f6368',unknown:'#b06000'};
+                const labels = {positive:'正向差',negative:'负向差',neutral:'基本一致',unknown:'数据不足'};
+                return `<tr><td>${escapeHtml(year)}</td><td>${formatResearchNumber(item.current_price)}</td><td>${formatResearchNumber(item.shares_outstanding)}</td><td>${formatResearchNumber(item.target_market_cap)}</td><td>${formatRate(item.required_return)}</td><td>${formatResearchNumber(item.assumed_pe,'×')}</td><td><b>${formatResearchNumber(modelImpliedProfit)}</b></td><td>${formatRate(item.implied_net_profit_growth)}</td><td>${formatResearchNumber(item.implied_revenue)}</td><td>${formatRate(item.implied_revenue_growth)}</td><td><b>${consensusAvailable ? formatResearchNumber(consensusProfit) : 'Unavailable'}</b></td><td><b>${formatResearchNumber(agentForecastProfit)}</b></td><td style="color:${colors[direction]};font-weight:700">${labels[direction]}</td></tr>`;
+            }).join('');
+            return rows ? `<div style="padding:8px;background:#fef7e0;border-radius:6px;font-size:10px;margin-bottom:8px"><b>Series definitions:</b> Market Consensus is available only from validated independent consensus sources; Model-Implied Earnings is the earnings path reverse-engineered from the current price; Agent Forecast is the Base scenario generated by the model.</div><div style="overflow-x:auto"><table style="width:100%;min-width:1350px;border-collapse:collapse;font-size:9px"><thead><tr style="background:#f1f3f4"><th>年份</th><th>当前价格</th><th>总股本(亿股)</th><th>目标市值</th><th>要求回报</th><th>退出PE假设</th><th>Model-Implied Earnings</th><th>利润增长</th><th>价格隐含收入</th><th>收入增长</th><th>Market Consensus</th><th>Agent Forecast</th><th>预期差</th></tr></thead><tbody>${rows}</tbody></table></div>` : '<div style="color:var(--text-secondary)"><b>Market Consensus:</b> Unavailable<br><b>Model-Implied Earnings:</b> Unavailable<br><b>Agent Forecast:</b> Unavailable</div>';
+        }
+
+        function renderValuationScenarios(valuation, evidenceItems) {
+            const scenarios = Array.isArray(valuation.scenarios) ? valuation.scenarios : [];
+            const unit = escapeHtml(valuation.unit || '亿元');
+            const meta = {
+                bear: {label:'Bear 悲观', color:'#188038', bg:'#e6f4ea'},
+                base: {label:'Base 基准', color:'#1a73e8', bg:'#e8f0fe'},
+                bull: {label:'Bull 乐观', color:'#d93025', bg:'#fce8e6'}
+            };
+            const cards = scenarios.map(scenario => {
+                const style = meta[scenario.name] || {label:scenario.name || '情景', color:'#5f6368', bg:'#f1f3f4'};
+                const projections = Array.isArray(scenario.projections) ? scenario.projections : [];
+                const projectionRows = projections.map(item => { const methodLabels={pe:'PE',ev_ebitda:'EV/EBITDA',ev_sales:'EV/Sales',pb:'PB',unavailable:'不可用'}; return `<tr><td>${escapeHtml(item.year)}</td><td>${formatResearchNumber(item.revenue)}</td><td>${formatRate(item.revenue_growth)}</td><td>${formatRate(item.gross_margin)}</td><td>${formatResearchNumber(item.gross_profit)}</td><td>${formatResearchNumber(item.ebit)}</td><td>${formatResearchNumber(item.ebitda)}</td><td>${formatResearchNumber(item.free_cash_flow)}<div style="font-size:8px;color:var(--text-secondary)">${escapeHtml(item.fcf_unavailable_reason || '')}</div></td><td><b>${formatResearchNumber(item.net_profit)}</b></td><td><b>${escapeHtml(methodLabels[item.valuation_method] || item.valuation_method || '-')}</b><div style="font-size:8px;color:var(--text-secondary)">${escapeHtml(item.method_selection_reason || '-')}</div>${renderValuationCandidates(item)}${item.method_warning ? `<div style="font-size:8px;color:#b06000">${escapeHtml(item.method_warning)}</div>` : ''}</td><td>${formatResearchNumber(item.valuation_multiple,'×')}</td><td>${formatResearchNumber(item.enterprise_value)}</td><td>${formatResearchNumber(item.net_debt)}</td><td><b>${formatResearchNumber(item.equity_value)}</b></td><td>${item.calculation_valid ? 'PASS' : 'FAIL'}<div style="font-size:8px;color:var(--text-secondary)">${escapeHtml(item.valuation_formula || '-')}</div></td></tr>`; }).join('');
+                const legacyMetrics = [
+                    ['目标年份', scenario.target_year || '-'], ['收入', formatResearchNumber(scenario.revenue)],
+                    ['净利润', formatResearchNumber(scenario.net_profit)], ['估值倍数', formatResearchNumber(scenario.valuation_multiple,'×')],
+                    ['隐含市值', formatResearchNumber(scenario.implied_market_cap)]
+                ];
+                return `<div style="border:1px solid var(--border);border-top:5px solid ${style.color};border-radius:9px;padding:12px;background:white;margin-top:10px">
+                    <div style="display:flex;justify-content:space-between;align-items:center"><b style="font-size:14px;color:${style.color}">${escapeHtml(style.label)}</b><span>${renderGateBadge(scenario.evidence_gate)} <span style="padding:2px 8px;border-radius:12px;background:${style.bg};color:${style.color};font-weight:700">情景概率 ${formatProbability(scenario.probability)}</span></span></div>
+                    <div style="font-size:10px;margin-top:6px"><b>互斥事件定义：</b>${escapeHtml(scenario.event_definition || '-')} · ${escapeHtml(scenario.horizon || '-')}<div style="color:var(--text-secondary)">${escapeHtml((scenario.boundary_conditions || []).join('；'))}</div></div>
+                    <div style="display:grid;grid-template-columns:repeat(3,minmax(120px,1fr));gap:7px;margin-top:9px"><div style="padding:8px;background:${style.bg};border-radius:6px"><div style="font-size:9px;color:var(--text-secondary)">Target Price</div><b>${formatResearchNumber(scenario.target_price)}</b></div><div style="padding:8px;background:${style.bg};border-radius:6px"><div style="font-size:9px;color:var(--text-secondary)">Price Return</div><b>${formatRate(scenario.price_return)}</b></div><div style="padding:8px;background:${style.bg};border-radius:6px"><div style="font-size:9px;color:var(--text-secondary)">Annualized Return</div><b>${formatRate(scenario.annualized_price_return)}</b></div></div>
+                    ${projectionRows ? `<div style="overflow-x:auto;margin-top:9px"><table style="width:100%;min-width:1750px;border-collapse:collapse;font-size:9px"><thead><tr style="background:#f1f3f4"><th>年份</th><th>程序收入</th><th>增长率</th><th>毛利率</th><th>程序毛利</th><th>EBIT</th><th>EBITDA</th><th>FCF</th><th>净利润</th><th>估值方法 / 原因 / 候选</th><th>倍数</th><th>EV</th><th>净债务</th><th>Equity Value</th><th>恒等式 / 公式</th></tr></thead><tbody>${projectionRows}</tbody></table></div>` : `<div style="display:grid;grid-template-columns:repeat(5,1fr);gap:6px;margin-top:8px">${legacyMetrics.map(metric => `<div style="padding:7px;background:#f8f9fa;border-radius:5px"><div style="font-size:9px;color:var(--text-secondary)">${metric[0]}</div><b>${metric[1]}</b></div>`).join('')}</div>`}
+                    <div style="display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin-top:8px"><div><b style="font-size:10px">核心假设</b>${researchList(scenario.assumptions)}</div><div><b style="font-size:10px">概率依据</b>${researchList(scenario.probability_basis)}</div></div>
+                    ${renderCompactEvidence(scenario.evidence_refs, evidenceItems)}
+                </div>`;
+            }).join('');
+            return `<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;margin-bottom:10px"><div style="padding:9px;background:#f8f9fa;border-radius:6px"><div style="font-size:9px;color:var(--text-secondary)">Current Price</div><b>${formatResearchNumber(valuation.current_price)}</b></div><div style="padding:9px;background:#e8f0fe;border-radius:6px"><div style="font-size:9px;color:var(--text-secondary)">Probability-Weighted Target Price</div><b>${formatResearchNumber(valuation.probability_weighted_target_price)}</b></div><div style="padding:9px;background:#e8f0fe;border-radius:6px"><div style="font-size:9px;color:var(--text-secondary)">Expected Price Return</div><b>${formatRate(valuation.expected_price_return)}</b></div><div style="padding:9px;background:#e8f0fe;border-radius:6px"><div style="font-size:9px;color:var(--text-secondary)">Annualized Expected Return</div><b>${formatRate(valuation.annualized_expected_return)}</b></div></div>
+                <div style="padding:8px;background:#e8f0fe;border-radius:6px;font-size:10px"><b>财务桥方法：</b>${escapeHtml(valuation.financial_bridge_method || '收入→毛利→期间费用→经营利润→税费→净利润')}</div>
+                <div style="margin-top:10px;padding:10px;background:#f8f9fa;border-radius:7px"><b>Pre-Valuation Probability Gate</b><div style="margin-top:7px">${renderPreValuationProbabilityAudit(valuation.pre_valuation_probability_audit, evidenceItems)}</div></div>
+                ${cards || '<div style="color:var(--text-secondary);margin-top:8px">暂无估值情景</div>'}
+                <div style="margin-top:10px;padding:10px;background:#f8f9fa;border-radius:7px"><b>Forecast Reasonableness Audit</b><div style="margin-top:7px">${renderForecastReasonablenessAudit(valuation.forecast_reasonableness_audit, evidenceItems)}</div></div>
+                <div style="margin-top:10px;padding:10px;background:#f8f9fa;border-radius:7px"><b>Comparable Valuation Evidence Audit</b><div style="margin-top:7px">${renderComparableEvidenceAudit(valuation.comparable_valuation_evidence_audit, evidenceItems)}</div></div>
+                <div style="margin-top:10px;padding:10px;background:#f8f9fa;border-radius:7px"><b>Scenario Valuation + Expected Return Formula Audit</b><div style="margin-top:7px">${renderValuationAudit(valuation.valuation_audit)}</div></div>
+                <div style="margin-top:10px;padding:10px;background:#f8f9fa;border-radius:7px"><b>Valuation Method Comparability Audit</b><div style="margin-top:7px">${renderComparabilityAudit((valuation.valuation_audit || {}).comparability_audit)}</div></div>
+                <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(500px,1fr));gap:10px;margin-top:10px"><div style="padding:10px;background:#f8f9fa;border-radius:7px"><b>Required Earnings Gap</b><div style="margin-top:7px">${renderRequiredEarningsGap(valuation.required_earnings_gap)}</div></div><div style="padding:10px;background:#f8f9fa;border-radius:7px"><b>Valuation Gap</b><div style="margin-top:7px">${renderValuationGap(valuation.valuation_gap)}</div></div></div>
+                <div style="margin-top:10px;padding:10px;background:#f8f9fa;border-radius:7px"><b>Core Variable Sensitivity Audit</b><div style="margin-top:7px">${renderSensitivityAudit(valuation.sensitivity_audit)}</div></div>
+                <div style="display:grid;grid-template-columns:repeat(2,1fr);gap:10px;margin-top:10px"><div style="padding:10px;background:#f8f9fa;border-radius:7px"><b>当前市值隐含假设</b>${researchList(valuation.current_implied_assumptions)}</div><div style="padding:10px;background:#f8f9fa;border-radius:7px"><b>敏感性摘要</b>${researchList(valuation.sensitivity)}</div></div>
+                <div style="font-size:11px;color:var(--text-secondary);margin-top:8px">当前市值：${formatResearchNumber(valuation.current_market_cap)} ${unit}　末期概率加权市值：${formatResearchNumber(valuation.probability_weighted_market_cap)} ${unit}</div>`;
+        }
+
+        function renderCatalysts(catalyst, evidenceItems) {
+            const items = catalyst.catalysts || [];
+            if (!items.length) return '<div style="color:var(--text-secondary)">历史研究没有 Catalyst 阶段；新研究将生成可观察催化剂。</div>';
+            const timeLabels = {"30d":'未来30天',quarter:'未来1季度',half_year:'未来半年',one_year:'未来1年'};
+            const cards = items.map(item => `<div style="border:1px solid var(--border);border-left:4px solid ${item.direction === 'negative' ? '#188038' : '#f9ab00'};border-radius:8px;padding:10px;background:white">
+                <div style="display:flex;justify-content:space-between;gap:8px"><b>${escapeHtml(item.event)}</b><span class="tag">${escapeHtml(timeLabels[item.timeframe] || item.timeframe)}</span></div>
+                <div style="font-size:10px;margin-top:6px"><b>重定价机制：</b>${escapeHtml(item.repricing_mechanism || '-')}</div>
+                <div style="display:grid;grid-template-columns:repeat(2,1fr);gap:6px;margin-top:7px"><div style="padding:6px;background:#f8f9fa;border-radius:5px"><b>观察指标</b><div>${escapeHtml(item.observable_metric || '-')}</div></div><div style="padding:6px;background:#f8f9fa;border-radius:5px"><b>超预期阈值</b><div>${escapeHtml(item.surprise_threshold || '-')}</div></div></div>
+                <div style="margin-top:7px;font-size:10px"><b>条件概率：</b>${formatRate(item.probability)}　关联节点：${escapeHtml((item.linked_story_nodes || []).join('、') || '-')}</div>
+                ${renderCompactEvidence(item.evidence_refs,evidenceItems)}
+            </div>`).join('');
+            return `<div style="padding:9px;background:#fef7e0;border-radius:7px;margin-bottom:9px"><b>重定价路径：</b>${escapeHtml((catalyst.repricing_path || []).join(' → ') || '暂无')}<div style="font-size:10px;margin-top:4px"><b>缺少催化剂的风险：</b>${escapeHtml(catalyst.no_catalyst_risk || '-')}</div></div><div style="display:grid;grid-template-columns:repeat(2,minmax(260px,1fr));gap:9px">${cards}</div>`;
+        }
+
+        function renderBearCase(bear, evidenceItems) {
+            const risks = Array.isArray(bear.risks) ? bear.risks : [];
+            const attacks = Array.isArray(bear.causal_attacks) ? bear.causal_attacks : [];
+            const categoryLabels = {demand:'需求',customer:'客户',technology:'技术',financial:'财务',cash_flow:'现金流',receivables:'应收',inventory:'存货',litigation:'诉讼',competition:'竞争',strategy:'战略失败',valuation:'估值',governance:'治理',other:'其他'};
+            const impactMeta = {
+                low:{label:'低影响',color:'#5f6368',bg:'#f1f3f4'}, medium:{label:'中影响',color:'#b06000',bg:'#fef7e0'},
+                high:{label:'高影响',color:'#d93025',bg:'#fce8e6'}, critical:{label:'致命影响',color:'#a50e0e',bg:'#f8d7da'}
+            };
+            const attackCards = attacks.map((attack, index) => { const impact=impactMeta[attack.severity]||impactMeta.high; return `<div style="padding:9px;border-left:4px solid ${impact.color};background:${impact.bg};border-radius:6px"><b>${index + 1}. 攻击 ${escapeHtml(attack.from_node)} → ${escapeHtml(attack.to_node)}</b><div style="font-size:10px;margin-top:4px"><b>多头假设：</b>${escapeHtml(attack.assumed_causality)}</div><div style="font-size:10px;margin-top:3px"><b>替代解释：</b>${escapeHtml(attack.alternative_explanation)}</div><div style="font-size:10px;margin-top:3px"><b>断裂条件：</b>${escapeHtml(attack.break_condition)}</div>${renderCompactEvidence(attack.evidence_refs,evidenceItems)}</div>`; }).join('');
+            const riskCards = risks.map((risk, index) => {
+                const impact = impactMeta[risk.impact] || impactMeta.medium;
+                const probability = Math.max(0, Math.min(1, Number(risk.probability) || 0));
+                return `<div style="border:1px solid var(--border);border-left:4px solid ${impact.color};border-radius:8px;padding:11px;background:white"><div style="display:flex;justify-content:space-between;gap:8px"><b>${index + 1}. ${escapeHtml(risk.risk || '未命名风险')}</b><div style="white-space:nowrap"><span class="tag">${escapeHtml(categoryLabels[risk.category] || risk.category || '其他')}</span> <span style="padding:2px 6px;border-radius:10px;background:${impact.bg};color:${impact.color};font-size:9px;font-weight:700">${impact.label}</span></div></div><div style="margin-top:7px"><div style="display:flex;justify-content:space-between;font-size:10px"><span>发生概率</span><b style="color:${impact.color}">${formatRate(probability)}</b></div><div style="height:5px;background:#e8eaed;border-radius:3px;overflow:hidden"><div style="height:100%;width:${probability * 100}%;background:${impact.color}"></div></div></div><div style="padding:7px;background:#f8f9fa;border-radius:5px;margin-top:8px;font-size:10px"><b>验证方式：</b>${escapeHtml(risk.verification || '暂无')}</div>${renderCompactEvidence(risk.evidence_refs, evidenceItems)}</div>`;
+            }).join('');
+            return `<div style="padding:11px;border-left:5px solid var(--danger);background:#fce8e6;border-radius:7px;margin-bottom:10px"><b>最强反证</b><div style="margin-top:4px;line-height:1.65">${escapeHtml(bear.strongest_disproof || '暂无')}</div>${(bear.false_premises || []).length ? `<div style="margin-top:5px"><b>可能错误前提：</b>${escapeHtml(bear.false_premises.join('；'))}</div>` : ''}</div>
+                ${attackCards ? `<h4 style="margin:10px 0 6px">因果链攻击</h4><div style="display:grid;grid-template-columns:repeat(2,1fr);gap:8px">${attackCards}</div>` : ''}
+                <h4 style="margin:12px 0 6px">风险清单</h4><div style="display:grid;grid-template-columns:repeat(2,minmax(260px,1fr));gap:10px">${riskCards || '<div style="color:var(--text-secondary)">暂无风险项</div>'}</div>
+                <div style="display:grid;grid-template-columns:repeat(2,1fr);gap:10px;margin-top:10px"><div style="padding:10px;background:#fce8e6;border-radius:7px"><b>逻辑破坏条件</b>${researchList(bear.thesis_breakers)}</div><div style="padding:10px;background:#e8f0fe;border-radius:7px"><b>证伪检查</b>${researchList(bear.falsification_tests)}</div></div>`;
+        }
+
+        function renderEvidenceLayer(items) {
+            const values = Array.isArray(items) ? items : [];
+            if (!values.length) return '<div style="color:var(--text-secondary)">暂无证据</div>';
+            const typeLabels = {
+                quote:'行情', valuation:'估值', financial_data:'财务数据', company_data:'主营构成',
+                news:'新闻', web:'网页', local_knowledge:'本地知识库', other:'其他'
+            };
+            const truncate = (value, limit = 220) => {
+                const text = String(value || '').replace(/\s+/g, ' ').trim();
+                return text.length > limit ? `${text.slice(0, limit)}…` : text;
+            };
+            const excerptView = item => {
+                const raw = String(item.excerpt || '').trim();
+                if (!raw || raw === String(item.fact || '').trim()) return '';
+                let parsed = null;
+                try { parsed = JSON.parse(raw); } catch (_) {}
+                let preview = '';
+                let detailLabel = '查看原始证据';
+                if (item.source_type === 'financial_data' && Array.isArray(parsed)) {
+                    const latest = parsed[parsed.length - 1] || {};
+                    const metrics = [
+                        ['报告期', latest['报告期']], ['营业收入', latest['营业总收入']],
+                        ['收入同比', latest['营业总收入同比增长率']], ['净利润', latest['净利润']],
+                        ['利润同比', latest['净利润同比增长率']], ['毛利率', latest['销售毛利率']]
+                    ];
+                    preview = `<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:5px;margin-top:7px">${metrics.map(metric => `<div style="padding:6px;background:#f8f9fa;border-radius:5px"><div style="font-size:9px;color:var(--text-secondary)">${metric[0]}</div><b style="font-size:10px">${escapeHtml(metric[1] || '-')}</b></div>`).join('')}</div>`;
+                    detailLabel = `查看全部 ${parsed.length} 期财务原始数据`;
+                } else if (item.source_type === 'company_data' && Array.isArray(parsed) && parsed.length) {
+                    const company = parsed[0] || {};
+                    preview = `<div style="font-size:10px;line-height:1.65;margin-top:7px;padding:7px;background:#f8f9fa;border-radius:5px"><b>主营：</b>${escapeHtml(truncate(company['主营业务'], 150))}<br><b>产品：</b>${escapeHtml(truncate(company['产品类型'] || company['产品名称'], 150))}</div>`;
+                    detailLabel = '查看完整主营与经营范围';
+                } else {
+                    preview = `<div style="font-size:10px;color:var(--text-secondary);line-height:1.65;margin-top:7px;padding:7px;background:#f8f9fa;border-radius:5px">${escapeHtml(truncate(raw))}</div>`;
+                }
+                const formatted = parsed ? JSON.stringify(parsed, null, 2) : raw;
+                return `${preview}<details style="margin-top:6px"><summary style="font-size:10px;color:var(--primary);cursor:pointer">${escapeHtml(detailLabel)}</summary><pre style="white-space:pre-wrap;overflow:auto;max-height:260px;margin-top:6px;padding:8px;background:#202124;color:#e8eaed;border-radius:6px;font-size:9px;line-height:1.5">${escapeHtml(formatted)}</pre></details>`;
+            };
+            return `<div style="display:grid;grid-template-columns:repeat(2,minmax(280px,1fr));gap:9px">${values.map((item, index) => {
+                const date = item.publication_date || item.information_date || (item.retrieved_at || '').slice(0, 10) || '日期未知';
+                const confidenceValue = Number(item.confidence);
+                const confidence = Number.isFinite(confidenceValue) ? Math.max(0, Math.min(1, confidenceValue)) : 0;
+                const confidenceColor = confidence >= .8 ? '#188038' : (confidence >= .6 ? '#b06000' : '#d93025');
+                const safeUrl = /^https?:\/\//i.test(item.source_url || '') ? escapeHtml(item.source_url) : '';
+                const source = escapeHtml(item.source || '来源未知');
+                const sourceHtml = safeUrl ? `<a href="${safeUrl}" target="_blank" rel="noopener noreferrer" style="color:var(--primary);text-decoration:none">${source}</a>` : source;
+                const typeLabel = typeLabels[item.source_type] || item.source_type || '其他';
+                const grade = item.source_grade || 'C';
+                const gradeColor = grade === 'A' ? '#188038' : (grade === 'B' ? '#1a73e8' : '#b06000');
+                const freshness = item.freshness_days == null ? '日期未知' : `${item.freshness_days}天前`;
+                const isFutureInvalid = item.temporal_scope === 'future';
+                const currentLabel = isFutureInvalid ? 'Future / Look-ahead Invalid' : (item.supports_current_claim ? '可支持当前结论' : (item.temporal_scope === 'historical' ? '仅作历史证据' : '当前适用性不足'));
+                const statusColor = isFutureInvalid ? '#d93025' : (item.supports_current_claim ? '#188038' : '#b06000');
+                return `<div style="border:1px solid var(--border);border-radius:8px;padding:11px;background:white;align-self:start">
+                    <div style="display:flex;justify-content:space-between;gap:8px"><b style="line-height:1.6">${index + 1}. ${escapeHtml(item.fact || '未提供事实摘要')}</b><div style="white-space:nowrap"><span style="font-size:9px;padding:2px 6px;background:#f1f3f4;border-radius:10px">${escapeHtml(typeLabel)}</span> <span style="font-size:9px;padding:2px 6px;border:1px solid ${gradeColor};color:${gradeColor};border-radius:10px;font-weight:700">${escapeHtml(grade)}级</span></div></div>
+                    ${excerptView(item)}
+                    <div style="font-size:10px;margin-top:7px">来源：${sourceHtml} · ${escapeHtml(date)}</div>
+                    <div style="font-size:9px;color:${statusColor};margin-top:4px;font-weight:${isFutureInvalid ? '700' : '400'}">${escapeHtml(freshness)} · ${escapeHtml(currentLabel)}</div>
+                    ${isFutureInvalid ? `<div style="font-size:10px;color:var(--danger);background:#fce8e6;border-radius:5px;padding:6px;margin-top:5px">${escapeHtml(item.invalid_reason || 'Evidence is dated after the analysis date and is invalid for this analysis.')}</div>` : ''}
+                    <div style="display:flex;align-items:center;gap:7px;margin-top:6px"><span style="font-size:9px;color:var(--text-secondary)">可信度</span><div style="height:5px;background:#e8eaed;border-radius:3px;overflow:hidden;flex:1"><div style="height:100%;width:${confidence * 100}%;background:${confidenceColor}"></div></div><b style="font-size:9px;color:${confidenceColor}">${formatRate(confidence)}</b></div>
+                    <div style="font-size:9px;color:var(--text-secondary);margin-top:5px">${escapeHtml(item.id || '')}</div>
+                </div>`;
+            }).join('')}</div>`;
+        }
+
+        function renderJudgmentAnswer(answer, evidenceItems, tone) {
+            const item = answer || {};
+            const color = tone === 'risk' ? '#d93025' : '#1a73e8';
+            return `<div style="border-left:4px solid ${color};padding:10px 12px;background:#f8f9fa;border-radius:7px"><div style="display:flex;justify-content:space-between;gap:8px"><b>${escapeHtml(item.conclusion || '证据不足')}</b>${renderGateBadge(item.evidence_gate)}</div>${(item.mechanisms || []).length ? researchList(item.mechanisms) : ''}${item.most_likely_failure ? `<div style="font-size:10px;margin-top:6px"><b>最可能失效点：</b>${escapeHtml(item.most_likely_failure)}</div>` : ''}${item.falsifier ? `<div style="font-size:10px;margin-top:5px"><b>证伪条件：</b>${escapeHtml(item.falsifier)}</div>` : ''}${renderCompactEvidence(item.evidence_refs, evidenceItems)}</div>`;
+        }
+
+        function renderCompanyResearchResult(data) {
+            const el = document.getElementById('companyResearchResult');
+            if (!el || !data) return;
+            const judge = data.judge || {};
+            const expectation = data.expectation || {};
+            const story = data.story || {};
+            const stories = story.stories || [];
+            const company = data.company || {};
+            const research = data.research || {};
+            const marketSnapshot = data.market_snapshot || research.market_snapshot || {};
+            const valuation = data.valuation || {};
+            const scenarios = Array.isArray(valuation.scenarios) ? valuation.scenarios : [];
+            const catalyst = data.catalyst || {};
+            const bear = data.bear || {};
+            const mispricing = data.mispricing || {};
+            const presentation = data.presentation || {};
+            const risks = bear.risks || [];
+            const evidence = research.evidence || data.evidence || [];
+            const tracking = judge.tracking_plan || {};
+            const impliedPath = [expectation.price_implied_path, expectation.market_implied_path, valuation.reverse_valuation].find(items => Array.isArray(items) && items.length) || [];
+            const firstModelImplied = impliedPath.find(item => item && item.implied_net_profit != null);
+            const firstComparisonImplied = (valuation.forecast_comparison || []).find(item => item && (item.model_implied_profit != null || item.market_implied_profit != null));
+            const currentImpliedEarnings = firstModelImplied?.implied_net_profit ?? firstComparisonImplied?.model_implied_profit ?? firstComparisonImplied?.market_implied_profit;
+            const currentPrice = valuation.current_price ?? marketSnapshot.price ?? impliedPath[0]?.current_price;
+            const targetPrice = name => scenarios.find(item => item.name === name)?.target_price;
+
+            // 用户层只聚合已有结果，不创建新 Gate，也不改变任何底层放行条件。
+            const consistency = marketSnapshot.consistency_report || {};
+            const forecast = valuation.forecast_reasonableness_audit || {};
+            const scenarioTrigger = valuation.scenario_trigger_audit || {};
+            const comparable = valuation.comparable_valuation_evidence_audit || {};
+            const methodApplicability = valuation.valuation_method_applicability_audit || {};
+            const doubleCounting = valuation.double_counting_audit || {};
+            const valuationValidity = valuation.valuation_audit || {};
+            const gap = mispricing.maximum_gap || {};
+            const gapGate = mispricing.gate || {};
+            const evidenceVerdict = judge.evidence_based_verdict || mispricing.evidence_based_verdict || {};
+            const deterministicVerdict = judge.investment_verdict || valuation.deterministic_investment_verdict || {};
+            const firstIssue = (groups, fallback) => {
+                for (const group of groups) {
+                    const values = Array.isArray(group) ? group : [];
+                    const found = values.find(item => String(item || '').trim());
+                    if (found) return researchChinese(found);
+                }
+                return fallback;
+            };
+            const forecastChecks = [
+                forecast.historical_anchor_passed,
+                forecast.margin_bridge_passed,
+                forecast.scenario_separation_passed,
+                forecast.margin_expansion_evidence_passed,
+                forecast.passed,
+                scenarioTrigger.passed,
+            ];
+            const valuationChecks = [
+                comparable.passed,
+                methodApplicability.passed,
+                doubleCounting.passed,
+                valuationValidity.passed,
+            ];
+            const passedCount = checks => checks.filter(value => value === true).length;
+            const forecastAvailable = Object.keys(forecast).length > 0 || Object.keys(scenarioTrigger).length > 0;
+            const forecastPassed = forecastAvailable && forecast.passed === true && scenarioTrigger.passed === true;
+            const valuationAvailable = Object.keys(valuationValidity).length > 0;
+            const valuationPassed = valuationAvailable && valuationChecks.every(value => value === true);
+            const gapAvailable = gapGate.benchmark_available === true && gap.agent_value != null && gap.benchmark_value != null;
+            const gapStatus = !gapAvailable ? '暂不可用' : (gap.significant ? '存在显著差距' : '未达到显著阈值');
+            const gapExplanation = (presentation.quick_conclusions || []).find(item => String(item.question || '').includes('预期差')) || {};
+            const verdictStatus = evidenceVerdict.status || deterministicVerdict.label || deterministicVerdict.status || '暂不能判断';
+            const layers = [
+                {
+                    name: 'Data Validity', label: '数据有效性',
+                    status: !Object.keys(consistency).length ? '暂不可用' : (consistency.passed ? '通过' : '阻断'),
+                    conclusion: consistency.summary || '尚未执行数据一致性检查。',
+                    data: `数据问题 ${Array.isArray(consistency.issues) ? consistency.issues.length : 0} 项；估值数据${consistency.valuation_allowed ? '允许使用' : '保持关闭'}。`,
+                    implication: consistency.valuation_allowed ? '现有市场数据可继续进入后续判断。' : '数据未通过时，暂不进入可靠估值。',
+                },
+                {
+                    name: 'Forecast Validity', label: '预测有效性',
+                    status: !forecastAvailable ? '暂不可用' : (forecastPassed ? '通过' : '阻断'),
+                    conclusion: forecastPassed ? '现有预测检查均已通过。' : firstIssue([forecast.issues, scenarioTrigger.issues], '至少一项现有预测检查未通过。'),
+                    data: `底层预测检查 ${passedCount(forecastChecks)} / ${forecastChecks.length} 项通过${forecast.key_driver ? `；关键变量：${researchChinese(forecast.key_driver)}` : ''}。`,
+                    implication: forecastPassed ? '预测可按原有规则进入估值。' : '不修改预测来换取通过；目标价和收益率继续保持关闭。',
+                },
+                {
+                    name: 'Expectation Gap', label: '预期差',
+                    status: gapStatus,
+                    conclusion: researchChinese(gapExplanation.conclusion || (gapAvailable ? `${gap.period || ''} ${gap.metric || ''} 的模型值与比较基准存在差异。` : '缺少可用比较基准，暂不能判断预期差。')),
+                    data: gapAvailable ? `比较基准 ${formatResearchNumber(gap.benchmark_value)}；模型 ${formatResearchNumber(gap.agent_value)}；差值 ${formatResearchNumber(gap.absolute_gap)}。` : 'Market Consensus 与价格反推基准均按现有可用性规则处理，不补造数据。',
+                    implication: researchChinese(gapExplanation.implication || '预期差只描述已有比较结果，不代表自动达到可投资条件。'),
+                },
+                {
+                    name: 'Valuation Validity', label: '估值有效性',
+                    status: !valuationAvailable ? '暂不可用' : (valuationPassed ? '通过' : '阻断'),
+                    conclusion: valuationPassed ? '现有估值证据、方法和数学检查均已通过。' : firstIssue([comparable.issues, methodApplicability.issues, doubleCounting.issues, valuationValidity.issues], '至少一项现有估值检查未通过。'),
+                    data: `底层估值检查 ${passedCount(valuationChecks)} / ${valuationChecks.length} 项通过；概率加权目标价 ${formatResearchNumber(valuation.probability_weighted_target_price)}；预期收益率 ${formatRate(valuation.expected_price_return)}。`,
+                    implication: valuationPassed ? '估值结果可进入最终判断。' : '不调整倍数或结果；明确显示估值无法确认。',
+                },
+                {
+                    name: 'Investment Verdict', label: '投资判断',
+                    status: researchChinese(verdictStatus),
+                    conclusion: researchChinese(evidenceVerdict.one_sentence_conclusion || deterministicVerdict.summary || '当前没有可用投资判断。'),
+                    data: researchChinese(evidenceVerdict.data || `目标价 ${formatResearchNumber(valuation.probability_weighted_target_price)}；预期收益率 ${formatRate(valuation.expected_price_return)}。`),
+                    implication: researchChinese(evidenceVerdict.implication || deterministicVerdict.valuation_block_reason || '保持现有投资判断，不自动生成交易建议。'),
+                },
+            ];
+            const layerColor = status => {
+                const text = String(status || '');
+                if (text.includes('通过') || text.includes('显著差距') || text.includes('达到可投资')) return '#188038';
+                if (text.includes('阻断') || text.includes('证伪') || text.includes('错误')) return '#d93025';
+                return '#b06000';
+            };
+            const layerCards = layers.map((layer, index) => {
+                const color = layerColor(layer.status);
+                return `<div style="border:1px solid var(--border);border-left:6px solid ${color};border-radius:10px;padding:13px;background:white"><div style="display:flex;justify-content:space-between;gap:10px"><div><div style="font-size:10px;color:var(--text-secondary)">${index + 1}. 核心判断</div><b style="font-size:16px">${escapeHtml(layer.label)}</b></div><b style="color:${color}">${escapeHtml(layer.status)}</b></div><div style="margin-top:8px;line-height:1.65"><b>${escapeHtml(layer.conclusion)}</b><div style="font-size:10px;margin-top:5px"><b>数据：</b>${escapeHtml(layer.data)}<br><b>这意味着什么：</b>${escapeHtml(layer.implication)}</div></div></div>`;
+            }).join('');
+            const decisionPoints = Array.isArray(presentation.quick_conclusions)
+                ? presentation.quick_conclusions.slice(0, 8) : [];
+            const decisionCards = decisionPoints.map((item, index) => `<div style="grid-column:${index === 0 ? '1 / -1' : 'auto'};padding:12px;border:1px solid var(--border);border-left:5px solid ${index === 0 ? '#188038' : '#1a73e8'};border-radius:9px;background:white"><div style="font-size:10px;color:var(--text-secondary)">${index + 1}. ${escapeHtml(researchChinese(item.question || ''))}</div><b style="display:block;font-size:${index === 0 ? '17px' : '14px'};margin-top:4px">${escapeHtml(researchChinese(item.conclusion || '暂无可靠结论'))}</b><div style="font-size:10px;line-height:1.65;margin-top:6px"><b>为什么：</b>${escapeHtml(researchChinese(item.why || '-'))}<br><b>关键数据：</b>${escapeHtml(researchChinese(item.data || '-'))}<br><b>这意味着什么：</b>${escapeHtml(researchChinese(item.implication || '-'))}</div></div>`).join('');
+
+            el.innerHTML = `
+                <div class="card" style="border-top:6px solid var(--primary)"><div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px"><div><div style="font-size:11px;color:var(--text-secondary)">普通投资者先看这里</div><b style="font-size:22px">现在值不值得投资、为什么、需要等待什么</b></div><span class="tag">简明结论</span></div><div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(310px,1fr));gap:9px;margin-top:12px">${decisionCards || '<div>暂无可靠结论</div>'}</div></div>
+                <div class="card"><div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px"><div><div style="font-size:11px;color:var(--text-secondary)">结论依据</div><b style="font-size:20px">五层核心判断</b></div><span class="tag">当前结果</span></div><div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:10px;margin-top:12px">${layerCards}</div></div>
+                <details class="card" style="margin-top:10px"><summary style="cursor:pointer;font-size:15px;font-weight:700;padding:4px">查看完整专业计算、证据和检查明细</summary><div style="margin-top:12px">
+                ${renderInvestorPresentation(presentation)}
+                ${renderUnifiedEvidenceStatus(mispricing)}
+                ${renderMispricingAnalysis(mispricing, evidence)}
+                ${renderInvestmentVerdict(judge.investment_verdict)}
+                <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:8px;margin-bottom:12px">
+                    <div class="card"><div style="font-size:11px;color:var(--text-secondary)">Bull Thesis · P(Bull)</div><b>${formatProbability(judge.bull_thesis_probability)}</b></div>
+                    <div class="card"><div style="font-size:11px;color:var(--text-secondary)">Fundamental Improvement</div><b>${formatProbability(judge.fundamental_delivery_probability)}</b></div>
+                    <div class="card"><div style="font-size:11px;color:var(--text-secondary)">Valuation Repricing</div><b>${formatProbability(judge.valuation_expansion_probability)}</b></div>
+                    <div class="card"><div style="font-size:11px;color:var(--text-secondary)">Downside Event · P(Bear)</div><b style="color:var(--danger)">${formatProbability(judge.downside_risk_probability)}</b></div>
+                    <div class="card"><div style="font-size:11px;color:var(--text-secondary)">Probability of Negative Return</div><b style="color:var(--danger)">${formatProbability(judge.probability_of_negative_return)}</b></div>
+                    <div class="card"><div style="font-size:11px;color:var(--text-secondary)">Story Chain · Diagnostic</div><b>${formatProbability(judge.story_chain_probability ?? judge.story_probability)}</b></div>
+                    <div class="card"><div style="font-size:11px;color:var(--text-secondary)">Current Price → Implied Earnings</div><b>${formatResearchNumber(currentPrice)} → ${formatResearchNumber(currentImpliedEarnings)}</b></div>
+                    <div class="card"><div style="font-size:11px;color:var(--text-secondary)">Bear Target Price</div><b>${formatResearchNumber(targetPrice('bear'))}</b></div>
+                    <div class="card"><div style="font-size:11px;color:var(--text-secondary)">Base Target Price</div><b>${formatResearchNumber(targetPrice('base'))}</b></div>
+                    <div class="card"><div style="font-size:11px;color:var(--text-secondary)">Bull Target Price</div><b>${formatResearchNumber(targetPrice('bull'))}</b></div>
+                    <div class="card"><div style="font-size:11px;color:var(--text-secondary)">Probability-Weighted Target Price</div><b>${formatResearchNumber(valuation.probability_weighted_target_price)}</b></div>
+                    <div class="card"><div style="font-size:11px;color:var(--text-secondary)">Expected Return</div><b>${formatRate(valuation.expected_price_return)}</b><div style="font-size:10px;color:var(--text-secondary);margin-top:4px">Annualized: <b>${formatRate(valuation.annualized_expected_return)}</b></div></div>
+                </div>
+                <div class="card"><h3>Probability Audit Trail</h3>${renderProbabilityAudit(valuation.probability_audit)}</div>
+                ${(judge.probability_basis || []).length ? `<div class="card"><h3>Probability Event Mapping</h3><div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:8px">${judge.probability_basis.map(item => `<div style="padding:9px;background:#f8f9fa;border-radius:7px"><div style="display:flex;justify-content:space-between"><b>${escapeHtml(item.metric)}</b><b>${formatProbability(item.value)}</b></div><div style="font-size:10px;margin-top:4px">${escapeHtml(item.formula)}</div>${researchList(item.factors)}</div>`).join('')}</div></div>` : ''}
+                <div class="card"><h3>Market Snapshot Consistency Report</h3>${renderConsistencyReport(marketSnapshot)}</div>
+                <div class="insight-grid">
+                    <div class="card"><h3>当前基本面</h3><div style="line-height:1.7">${escapeHtml(judge.current_fundamentals || '证据不足')}</div></div>
+                    <div class="card"><h3>市场正在交易什么</h3><div style="line-height:1.7">${escapeHtml(judge.current_market_story || '证据不足')}</div></div>
+                </div>
+                <div class="card"><h3>Market Consensus vs Model-Implied Earnings vs Agent Forecast</h3>${renderExpectationAnalysis(expectation, valuation, evidence)}</div>
+                <div class="card"><h3>Company Opportunity Mapping</h3>${renderOpportunityMapping(company, evidence)}</div>
+                <div class="insight-grid">
+                    <div class="card"><h3>如果市场低估：市场为什么会错？</h3>${renderJudgmentAnswer(judge.why_market_underestimates, evidence, 'opportunity')}</div>
+                    <div class="card"><h3>如果 Agent 错了：最可能错在哪里？</h3>${renderJudgmentAnswer(judge.agent_most_likely_wrong, evidence, 'risk')}</div>
+                </div>
+                <div class="card"><h3>潜在新故事与成立条件</h3><div class="insight-grid"><div>${researchList(judge.potential_new_stories)}</div><div>${researchList(judge.necessary_conditions)}</div></div></div>
+                <div class="insight-grid">
+                    <div class="card"><h3>财务影响</h3><div style="line-height:1.7">${escapeHtml(judge.financial_impact || '-')}</div></div>
+                    <div class="card"><h3>估值影响</h3><div style="line-height:1.7">${escapeHtml(judge.valuation_impact || '-')}</div></div>
+                </div>
+                <div class="card" style="border-left:4px solid var(--danger)"><h3>最大证伪点</h3><div style="line-height:1.7">${escapeHtml(judge.maximum_falsifier || '-')}</div></div>
+                <div class="card"><h3>下一步观察什么</h3><div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px"><div><b>未来30天</b>${researchList(tracking.next_30_days)}</div><div><b>未来1季度</b>${researchList(tracking.next_quarter)}</div><div><b>未来半年</b>${researchList(tracking.next_half_year)}</div></div></div>
+                <div class="card"><h3>故事依赖树（${stories.length}）</h3>${judge.most_uncertain_link ? `<div style="padding:8px;background:#fef7e0;border-radius:6px"><b>当前最不确定环节：</b>${escapeHtml(judge.most_uncertain_link)}</div>` : ''}${renderStoryTree(stories, evidence)}</div>
+                <div class="card"><h3>Investment Logic Tree</h3>${renderLogicTree(story.investment_tree, evidence)}</div>
+                <div class="card"><h3>程序化三年财务桥 + 自适应估值（${scenarios.length}个情景）</h3>${renderValuationScenarios(valuation, evidence)}</div>
+                <div class="card"><h3>Financial Logic Tree</h3>${renderLogicTree(valuation.financial_tree, evidence)}</div>
+                <div class="card"><h3>Catalyst：什么会让市场重新定价</h3>${renderCatalysts(catalyst, evidence)}</div>
+                <div class="card"><h3>Risk Logic Tree</h3>${renderLogicTree(bear.risk_tree, evidence)}</div>
+                <div class="card"><h3>Red Team / Bear Case（${risks.length}）</h3>${renderBearCase(bear, evidence)}</div>
+                <div class="card"><h3>证据层（${evidence.length}）</h3>${renderEvidenceLayer(evidence)}</div>
+                </div></details>
+                <div style="font-size:11px;color:var(--text-secondary);padding:8px">${escapeHtml(judge.disclaimer || '仅供研究，不构成投资建议。')}</div>`;
+        }
+
+        function renderCompanyResearchJob(job) {
+            const status = document.getElementById('companyResearchStatus');
+            if (!status) return;
+            const progress = Math.max(0, Math.min(100, Number(job.progress) || 0));
+            const labels = {queued:'排队中', running:'研究中', succeeded:'已完成', failed:'失败'};
+            status.innerHTML = `<div style="display:flex;justify-content:space-between;font-size:12px"><b>${escapeHtml(labels[job.status] || job.status)}</b><span>${progress}%</span></div><div style="height:7px;background:#e8eaed;border-radius:5px;margin:6px 0;overflow:hidden"><div style="height:100%;width:${progress}%;background:var(--primary);transition:width .3s"></div></div><div style="font-size:11px;color:${job.status === 'failed' ? 'var(--danger)' : 'var(--text-secondary)'}">${escapeHtml(job.error || job.message || '')}</div>`;
+        }
+
+        async function pollCompanyResearchTask() {
+            if (!companyResearchTaskId) return;
+            try {
+                const response = await fetch(`/api/company-research/tasks/${companyResearchTaskId}`);
+                const data = await response.json();
+                if (!response.ok) throw new Error(data.error || '查询任务失败');
+                renderCompanyResearchJob(data);
+                if (data.status === 'succeeded') {
+                    companyResearchTaskId = null;
+                    document.getElementById('companyResearchStart').disabled = false;
+                    renderCompanyResearchResult(data.result);
+                    await loadCompanyResearchHistory(false);
+                    return;
+                }
+                if (data.status === 'failed') {
+                    companyResearchTaskId = null;
+                    document.getElementById('companyResearchStart').disabled = false;
+                    return;
+                }
+                companyResearchPollTimer = setTimeout(pollCompanyResearchTask, 1800);
+            } catch (error) {
+                renderCompanyResearchJob({status:'failed', progress:0, error:error.message});
+                document.getElementById('companyResearchStart').disabled = false;
+            }
+        }
+
+        async function startCompanyResearch() {
+            const company = document.getElementById('researchCompany').value.trim();
+            const symbol = document.getElementById('researchSymbol').value.trim();
+            const search_depth = document.getElementById('researchDepth').value;
+            if (!company) { alert('请输入公司名称或股票代码'); return; }
+            const button = document.getElementById('companyResearchStart');
+            button.disabled = true;
+            renderCompanyResearchJob({status:'queued', progress:0, message:'正在提交研究任务'});
+            try {
+                const response = await fetch('/api/company-research/tasks', {
+                    method:'POST', headers:{'Content-Type':'application/json'},
+                    body:JSON.stringify({company, symbol, search_depth})
+                });
+                const data = await response.json();
+                if (!response.ok) throw new Error(data.error || '创建任务失败');
+                companyResearchTaskId = data.task_id;
+                clearTimeout(companyResearchPollTimer);
+                pollCompanyResearchTask();
+            } catch (error) {
+                button.disabled = false;
+                renderCompanyResearchJob({status:'failed', progress:0, error:error.message});
+            }
+        }
+
+        async function loadCompanyResearchAnalysis(analysisId) {
+            const result = document.getElementById('companyResearchResult');
+            result.innerHTML = '<div class="loading">正在读取历史研究</div>';
+            try {
+                const response = await fetch(`/api/company-research/analyses/${analysisId}`);
+                const data = await response.json();
+                if (!response.ok) throw new Error(data.error || '读取失败');
+                renderCompanyResearchResult(data);
+            } catch (error) {
+                result.innerHTML = `<div style="color:var(--danger)">${escapeHtml(error.message)}</div>`;
+            }
+        }
+
+        async function loadCompanyResearchHistory(loadLatest = true) {
+            const el = document.getElementById('companyResearchHistory');
+            if (!el) return;
+            try {
+                const response = await fetch('/api/company-research/analyses?limit=10');
+                const data = await response.json();
+                if (!response.ok) throw new Error(data.error || '读取历史失败');
+                const analyses = data.analyses || [];
+                el.innerHTML = analyses.length ? analyses.map(item => `<button data-analysis-id="${escapeHtml(item.id)}" style="display:block;width:100%;text-align:left;padding:7px;margin-bottom:5px;border:1px solid var(--border);border-radius:5px;background:white;cursor:pointer"><b>${escapeHtml(item.company)}</b> ${escapeHtml(item.symbol || '')}<br><span style="font-size:10px;color:var(--text-secondary)">${escapeHtml(item.analysis_date)} · ${escapeHtml(item.status)}</span></button>`).join('') : '<div style="font-size:12px;color:var(--text-secondary)">暂无研究记录</div>';
+                el.querySelectorAll('[data-analysis-id]').forEach(button => button.addEventListener('click', () => loadCompanyResearchAnalysis(button.dataset.analysisId)));
+                const latest = analyses.find(item => item.status === 'completed');
+                if (loadLatest && !companyResearchLoadedLatest && latest && !companyResearchTaskId) {
+                    companyResearchLoadedLatest = true;
+                    loadCompanyResearchAnalysis(latest.id);
+                }
+            } catch (error) {
+                el.innerHTML = `<div style="color:var(--danger);font-size:12px">${escapeHtml(error.message)}</div>`;
+            }
+        }
+
+        function loadCompanyResearch() { return loadCompanyResearchHistory(true); }
+
+        function enhanceCompanyResearch() {
+            const bar = document.querySelector('.tab-bar');
+            if (bar && !document.getElementById('companyResearchTabButton')) bar.insertAdjacentHTML('beforeend','<button id="companyResearchTabButton" class="tab-btn" onclick="showTab(7);loadCompanyResearch()">公司研究</button>');
+            const panel = document.querySelector('.data-panel');
+            if (panel && !document.getElementById('tab-7')) panel.insertAdjacentHTML('beforeend', `<div class="tab-content" id="tab-7"><div class="insight-grid"><div class="card"><h3>公司预期变化研究</h3><div style="display:flex;gap:7px;flex-wrap:wrap"><input id="researchCompany" placeholder="公司名称或股票代码" style="flex:1;min-width:160px;padding:7px;border:1px solid var(--border);border-radius:5px"><input id="researchSymbol" maxlength="6" placeholder="六位代码（可选）" style="width:120px;padding:7px;border:1px solid var(--border);border-radius:5px"><select id="researchDepth" style="padding:7px;border:1px solid var(--border);border-radius:5px"><option value="basic">基础检索</option><option value="deep">深度检索</option></select><button id="companyResearchStart" onclick="startCompanyResearch()" style="padding:7px 14px;background:var(--primary);color:white;border:none;border-radius:5px;cursor:pointer">开始研究</button></div><div style="font-size:11px;color:var(--text-secondary);margin-top:7px">后台依次执行 Research → Financial → Industry → Company → Story Evolution → Market Expectation → Implied Valuation → Catalyst → Red Team → Judge；离开本页不会中断。</div><div id="companyResearchStatus" style="margin-top:12px"></div></div><div class="card"><h3>历史研究</h3><div id="companyResearchHistory"><div class="loading">加载中</div></div></div></div><div id="companyResearchResult" style="margin-top:10px"><div class="card" style="color:var(--text-secondary)">输入公司后开始研究，完成结果会显示在这里。</div></div></div>`);
+        }
+
+        document.addEventListener('DOMContentLoaded', () => setTimeout(enhanceCompanyResearch, 0));
 
         function enhanceDashboard() {
             const search = document.getElementById('stockSearch');

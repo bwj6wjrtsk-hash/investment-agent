@@ -10,6 +10,7 @@ trades.json
 chat_history.json
 data/*.json
 data/chromadb/
+data/research_reports/
 
 # Python environments and caches
 .venv/

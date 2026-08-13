@@ -8,4 +8,7 @@ apscheduler>=3.10.0
 requests>=2.31.0
 numpy>=1.24.0
 flask>=3.0.0
-pywebview>=5.0.0
+pywebview==6.2.1
+fastapi==0.140.0
+streamlit==1.60.0
+uvicorn==0.49.0

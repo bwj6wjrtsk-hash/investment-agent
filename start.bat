@@ -14,5 +14,5 @@ for /f "tokens=5" %%a in ('netstat -ano ^| findstr ":5000" ^| findstr "LISTENING
 
 timeout /t 1 /nobreak >nul
 
-:: Launch desktop app
-python desktop.py
+:: Launch desktop app with the project virtual environment
+.venv\Scripts\python.exe desktop.py

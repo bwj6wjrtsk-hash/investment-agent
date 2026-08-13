@@ -188,3 +188,32 @@ investment-agent/
 - 增加 AI 选股策略
 - 接入交易接口（模拟盘）
 - 部署到服务器 24 小时运行
+
+
+## 上市公司预期变化研究（MVP）
+
+新增 `research_system/`，目标不是自动推荐股票，而是完成：信息 → 事实 → 行业/公司变化 → 故事变化 → 市场预期 → 盈利与估值 → 反证 → 概率化审判。
+
+### 架构
+
+固定 DAG：`Research → Financial → Industry → Company → Story Evolution → Price-Implied Expectations → Programmatic Valuation → Catalyst → Red Team → Judge`。所有 Agent 使用 DeepSeek，Agent 间只传 Pydantic Schema。系统显式维护投资逻辑树、财务兑现树、风险树三棵可审查逻辑树，分别描述为什么可能上涨、收入到 EPS 的兑现路径，以及独立的下行风险路径。
+
+系统采用“Research Engine Engineering”分工：LLM 负责理解事实、提出增长率/利润率/费用率/估值倍数等假设及解释；Python 计算引擎负责当前价格隐含盈利增长路径、三年 Revenue→Gross Profit→Opex→Net Profit 财务桥、估值和概率；SQLite 负责保存历史阶段状态、Evidence 与权威预期序列。预期比较固定为三条预测序列：**Model-Implied（模型反推）**、**Market Consensus（可靠市场一致预期）**、**Agent Forecast（估值引擎 Base 情景）**，并可附 Actual 实际值用于事后校验；旧 `expectation_timeline` 仅作兼容。价格隐含路径明确是给定要求回报率和退出倍数假设下的反推结果，不冒充市场一致预期。
+
+硬规则包括：所有增长率、利润率、费用率、要求回报率和概率统一使用 `0..1` 小数约定；情景调整概率按 `base_probability × evidence_factor` 计算，再对 Bear/Base/Bull 归一化。净利润大于0才允许 PE，亏损时自动切换 EV/EBITDA、EV/Sales 或 PB；核心当前结论必须满足“当前有效 A 级证据至少1条，或来自两个独立来源的当前有效 B 级证据至少2条”。Evidence 的 `available_at` 不得晚于 `analysis_date`，否则触发 Look-ahead Bias 失效；市场一致预期还必须通过来源独立性、时点可用性与 Market Consistency Gate，未通过时不得保存为可用共识。故事概率按 DAG 祖先闭包中的 `P(A) × P(B|A) × P(C|A,B)…` 联合计算，共享祖先只计算一次；Judge 必须同时回答“市场为什么可能低估”和“Agent 最可能错在哪里”。系统同时保留可观察 Catalyst 与因果链 Red Team，并输出 Bear/Base/Bull 各情景目标价、价格回报率，以及概率加权目标价和预期回报率。
+
+### 配置与启动
+
+1. 执行 `.venv\Scripts\pip.exe install -r requirements.txt`。
+2. 在 `.env` 配置 `DEEPSEEK_API_KEY`；可选配置 `TAVILY_API_KEY` 以补充公告、研报、政策和产业链检索。
+3. 双击项目根目录的 `start.bat`（或桌面快捷启动脚本）。
+4. DataBoard 桌面窗口会自动打开；公司研究位于“公司研究”页签。系统只监听 `127.0.0.1:5000`，无需单独启动 API 或 Streamlit。
+
+研究接口集成在原 DataBoard：
+
+- `POST /api/company-research/tasks`：提交后台研究任务
+- `GET /api/company-research/tasks/<task_id>`：查询任务进度
+- `GET /api/company-research/analyses`：查询历史研究
+- `GET /api/company-research/analyses/<analysis_id>`：读取完整研究结果
+
+研究数据库位于 `data/research.db`（已被 `.gitignore` 排除）。输出仅供研究，不构成投资建议，也不包含自动交易能力。
